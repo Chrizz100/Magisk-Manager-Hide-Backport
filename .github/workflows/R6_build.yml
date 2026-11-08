@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R6.3 - Remove Unused Compose Coroutine Scope
+name: Magisk Manager-Hide R6.4 - Deduplicate Historic Shared Java Classes
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Build Magisk 31.1 R6.3 with corrected Compose UI
+    name: Build Magisk 31.1 R6.4 after class ownership review
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     steps:
@@ -934,6 +934,82 @@ jobs:
             magisk/app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeViewModel.kt \
             magisk/app/core/src/main/res/values/strings.xml > reports/R6_source_SHA256SUMS.txt
 
+      - name: R6.4 - Eliminate verified duplicate legacy Java classes before R8
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_R64_CLASS_OWNERSHIP'
+          from pathlib import Path
+          from collections import defaultdict
+          import hashlib, json
+          root = Path('magisk/app')
+          source = root/'core/src/main/java'
+          shared = root/'shared/src/main/java'
+          # These byte-identical classes were retained in official v31.1 core but
+          # also restored into the historic :shared library in R5. This duplicates
+          # their fully-qualified class definitions when :core depends on :shared.
+          # Leave :shared as the single owner because :stub also depends on it.
+          expected = {
+              'com/topjohnwu/magisk/ProviderInstaller.java':
+                  '63c9731edf58aaceecfb9a31c2dae1129871d1fca6948a445ab803bb10645b65',
+              'com/topjohnwu/magisk/utils/APKInstall.java':
+                  'bec3e8844ed6a307c46ce4b991fbb1de3110e846acd62454cb863b9466ef9dc4',
+          }
+          settings=(root/'settings.gradle.kts').read_text()
+          gradle=(root/'core/build.gradle.kts').read_text()
+          assert 'api(project(":shared"))' in gradle, 'R6.1 shared dependency missing'
+          assert 'include(":apk", ":core", ":shared", ":stub", ":stub-res", ":test")' in settings
+          assert len(expected)==2
+
+          def index_classes():
+              indexed=defaultdict(dict)
+              for module in ('core','shared','apk','stub'):
+                  java=root/module/'src/main/java'
+                  assert java.is_dir(), f'Missing Java/Kotlin source root {java}'
+                  for path in java.rglob('*'):
+                      if path.is_file() and path.suffix in ('.java','.kt'):
+                          rel=path.relative_to(java).as_posix()
+                          indexed[rel][module]=path
+              return {key: modules for key,modules in indexed.items() if len(modules)>1}
+
+          collisions=index_classes()
+          assert set(collisions)==set(expected), f'Unexpected duplicate class-paths: {collisions.keys()}'
+          for rel, modules in collisions.items():
+              assert set(modules)=={'core','shared'}, f'Unexpected class owners: {rel}: {modules.keys()}'
+              a,b=modules['core'],modules['shared']
+              assert a.read_bytes()==b.read_bytes(), f'Classes differ: {rel}'
+              digest=hashlib.sha256(a.read_bytes()).hexdigest()
+              assert digest==expected[rel], f'Unexpected source hash: {rel}: {digest}'
+              assert ('class '+a.stem) in a.read_text(), f'Not a named Java class: {rel}'
+              a.unlink()
+              assert not a.exists() and b.is_file(), f'Failed safe deduplication: {rel}'
+
+          assert not index_classes(), 'Duplicate Java/Kotlin source paths remain'
+          for rel in expected:
+              assert (shared/rel).is_file(), f'Required shared implementation missing: {rel}'
+          # Both legacy callers and the current v31.1 networking layer still use
+          # these classes. They now resolve through :core -> :shared API linkage.
+          assert 'ProviderInstaller.install(context)' in (source/'com/topjohnwu/magisk/core/di/Networking.kt').read_text()
+          assert 'APKInstall.startSession' in (source/'com/topjohnwu/magisk/core/tasks/AppMigration.kt').read_text()
+          assert 'APKInstall.startSession' in (root/'stub/src/main/java/com/topjohnwu/magisk/DownloadActivity.java').read_text()
+
+          out=Path('reports/R6_4_verified_java_class_ownership.json')
+          out.parent.mkdir(exist_ok=True)
+          out.write_text(json.dumps({
+             'base':'Magisk v31.1 0972f67d97f9b6302b67c5171283330c74114b4a',
+             'resolution':'Removed only the identical core copies; shared retains sole class ownership',
+             'removed_from_core':expected,
+             'remaining_duplicates':[],
+             'native_build':'NOT_VERIFIED_IN_THIS_STEP',
+             'android_build':'NOT_VERIFIED_IN_THIS_STEP',
+          },indent=2,sort_keys=True)+'\n')
+          print('R6.4 legacy shared/core Java duplicate-class reconciliation: PASS')
+          PY_R64_CLASS_OWNERSHIP
+          git -C magisk diff --check
+          git -C magisk diff --binary > reports/R6_4_final_tracked_source.diff
+          git -C magisk status --short > reports/R6_4_final_source_status.txt
+          test -s reports/R6_4_verified_java_class_ownership.json
+
       - name: Verify complete R6 source bridge, rollback and resource contracts
         shell: bash
         run: |
@@ -1064,7 +1140,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: R6_3_COMPILER_EVIDENCE_DO_NOT_FLASH
+          name: R6_4_COMPILER_EVIDENCE_DO_NOT_FLASH
           path: reports/
           if-no-files-found: error
           retention-days: 14

@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R6 - Migration and Compose UI Compile Gate
+name: Magisk Manager-Hide R6.1 - Restore Core Shared Module Link
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # No manager migration UI yet. No device install. Stub build must be actually verified.
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Build official 31.1 with R3-R6 app migration and UI
+    name: Build Magisk 31.1 R6.1 with core shared dependency restored
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     steps:
@@ -855,6 +855,28 @@ jobs:
           R6_VERIFIED_SOURCE
           printf '%s  r6_migration.py\n' 'a063bd2664f38d825325610ef48c075088e2b23cf33e4e5b2a469eae4c79314b' | sha256sum -c -
           python3 r6_migration.py magisk
+          # R6.1: restore the exact original Magisk :core -> :shared Gradle API edge.
+          # R5 already restored :shared; R6 introduced imports of StubApk in core,
+          # but the removed API edge was not restored. That caused the 42517049587
+          # :core:compileReleaseKotlin "Unresolved reference StubApk" failure.
+          python3 - <<'PY_R61_SHARED_LINK'
+          from pathlib import Path
+          root=Path('magisk/app')
+          core=root/'core/build.gradle.kts'
+          source=root/'shared/src/main/java/com/topjohnwu/magisk/StubApk.java'
+          settings=(root/'settings.gradle.kts').read_text()
+          text=core.read_text()
+          anchor='dependencies {\n    coreLibraryDesugaring(libs.jdk.libs)\n'
+          assert text.count(anchor) == 1, 'Core Gradle dependencies changed unexpectedly'
+          assert 'api(project(":shared"))' not in text, 'Dependency already injected; refuse duplicate'
+          assert 'implementation(project(":shared"))' not in text, 'Other shared dependency already present'
+          assert source.is_file() and 'public class StubApk' in source.read_text(), 'Pinned StubApk.java missing'
+          assert 'include(":apk", ":core", ":shared", ":stub", ":stub-res", ":test")' in settings, 'shared Gradle module not configured'
+          text=text.replace(anchor,anchor+'    api(project(":shared"))\n',1)
+          core.write_text(text)
+          assert text.count('api(project(":shared"))') == 1
+          print('R6.1 original Magisk :core -> :shared API link restored: PASS')
+          PY_R61_SHARED_LINK
           git -C magisk diff --check
           git -C magisk diff --binary > reports/R6_tracked_source.diff
           git -C magisk diff --stat > reports/R6_tracked_stats.txt
@@ -901,6 +923,7 @@ jobs:
           assert 'dbStrings(Key.SU_MANAGER' not in read('app/core/src/main/java/com/topjohnwu/magisk/core/Config.kt')
           assert 'get_repackaged_manager_pkg' in read('native/src/core/db.rs')
           assert (m/'app/stub/src/main/java/com/topjohnwu/magisk/DynLoad.java').is_file()
+          assert 'api(project(":shared"))' in read('app/core/build.gradle.kts'), 'R6.1 shared-API dependency missing'
           assert 'from(stubTask)' in read('app/build-logic/src/main/java/Setup.kt')
           root=ET.parse(m/'app/core/src/main/res/values/strings.xml').getroot()
           names={e.get('name') for e in root if e.tag=='string'}
@@ -984,7 +1007,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: R6_MIGRATION_UI_COMPILER_EVIDENCE_DO_NOT_FLASH
+          name: R6_1_COMPILER_EVIDENCE_DO_NOT_FLASH
           path: reports/
           if-no-files-found: error
           retention-days: 14

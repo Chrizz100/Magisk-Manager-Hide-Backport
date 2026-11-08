@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R2 - Real Source Integration
+name: Magisk Manager-Hide R2.1 - Reviewed Manifest Repair
 
 on:
   push:
@@ -83,7 +83,7 @@ jobs:
           retention-days: 14
 
   reconstruct-and-build:
-    name: R2 - Reconstruct 31.1 manager-hide and build only if clean
+    name: R2.1 - Reconstruct 31.1 manager-hide and build only if clean
     needs: source-audit
     runs-on: ubuntu-24.04
     timeout-minutes: 95
@@ -118,7 +118,7 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Revert all 8 app-hide removal commits on 31.1
+      - name: Revert all 8 app-hide removal commits (reviewed manifest resolution)
         run: python3 kit/tools/reconstruct.py --repo magisk --reports reports
 
       - name: Set up Java 25 for Magisk build
@@ -182,7 +182,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: R2_RECONSTRUCTION_AND_BUILD_REPORT
+          name: R2_1_RECONSTRUCTION_AND_BUILD_REPORT
           path: reports/
           if-no-files-found: warn
           retention-days: 14

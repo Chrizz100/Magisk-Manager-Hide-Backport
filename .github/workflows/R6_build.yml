@@ -1,0 +1,990 @@
+name: Magisk Manager-Hide R6 - Migration and Compose UI Compile Gate
+
+# Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
+# No manager migration UI yet. No device install. Stub build must be actually verified.
+# Extends R4 and builds the old stub loader as an APK asset; UI still missing.
+# No main.zip, no Base64 code archives, no installation or flashing.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  r4-build:
+    name: Build official 31.1 with R3-R6 app migration and UI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 95
+    steps:
+      - name: Fetch official pinned v31.1 and its historical sources
+        uses: actions/checkout@v6
+        with:
+          repository: topjohnwu/Magisk
+          ref: 0972f67d97f9b6302b67c5171283330c74114b4a
+          path: magisk
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Restore original signer, APK-XML and key generator files
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit=0972f67d97f9b6302b67c5171283330c74114b4a
+          legacy_commit=ea16c8141eb64dc28b56a0e7fb536689ef465429
+          test "$(git -C magisk rev-parse HEAD)" = "$source_commit"
+          git -C magisk merge-base --is-ancestor "$legacy_commit" "$source_commit"
+          mkdir -p reports
+          : > reports/restored_sha256.txt
+          mkdir -p magisk/app/core/src/main/java/com/topjohnwu/magisk/core/signing
+          mapfile -t signer_files < <(git -C magisk ls-tree -r --name-only "$legacy_commit" app/core/src/main/java/com/topjohnwu/magisk/core/signing/ | grep -E '\.java$')
+          test "${#signer_files[@]}" -eq 5
+          for path in "${signer_files[@]}" \
+            app/core/src/main/java/com/topjohnwu/magisk/core/utils/AXML.kt \
+            app/core/src/main/java/com/topjohnwu/magisk/core/utils/Keygen.kt; do
+            git -C magisk cat-file -e "$legacy_commit:$path"
+            mkdir -p "magisk/$(dirname "$path")"
+            git -C magisk show "$legacy_commit:$path" > "magisk/$path"
+            test -s "magisk/$path"
+            sha256sum "magisk/$path" >> reports/restored_sha256.txt
+          done
+          test "$(wc -l < reports/restored_sha256.txt)" -eq 7
+          printf 'Recovered %s historical signer/XML/keystore files\n' "$(wc -l < reports/restored_sha256.txt)"
+
+      - name: Apply reviewed R3 native and R4 app bridge patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          cat > reports/r3-native.patch <<'R3_NATIVE_PATCH'
+          diff --git a/native/src/core/db.rs b/native/src/core/db.rs
+          index a2b94dbd5..495303c7d 100644
+          --- a/native/src/core/db.rs
+          +++ b/native/src/core/db.rs
+          @@ -260,0 +261,21 @@ impl MagiskD {
+          +    /// Read the optional legacy `requester` name as TEXT from v31.1's existing
+          +    /// `settings` table. SQLite's INTEGER affinity supports text rows, so this
+          +    /// does not downgrade the database or reintroduce the removed `strings` table.
+          +    /// Treat the value as *untrusted* until package.rs validates its APKs.
+          +    pub fn get_repackaged_manager_pkg(&self) -> String {
+          +        let mut value = String::new();
+          +        let mut on_row = |_: &[String], row: &DbValues| {
+          +            value.clear();
+          +            value.push_str(row.get_text(0));
+          +        };
+          +        self.db_exec_with_rows(
+          +            "SELECT COALESCE(CAST(value AS TEXT), '') FROM settings WHERE key='requester' LIMIT 1",
+          +            &[],
+          +            &mut on_row,
+          +        )
+          +        .sql_result()
+          +        .log()
+          +        .ok();
+          +        value
+          +    }
+          +
+          diff --git a/native/src/core/package.rs b/native/src/core/package.rs
+          index 94fea3ae4..a05cd45d7 100644
+          --- a/native/src/core/package.rs
+          +++ b/native/src/core/package.rs
+          @@ -6 +5,0 @@ use base::WalkResult::{Abort, Continue, Skip};
+          -use base::const_format::concatcp;
+          @@ -9 +8 @@ use base::{
+          -    Utf8CString, cstr, error, pre_order_walk,
+          +    Utf8CString, cstr, error, fd_get_attr, pre_order_walk,
+          @@ -15,0 +15 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
+          +use std::os::fd::AsRawFd;
+          @@ -51 +51 @@ macro_rules! bad_apk {
+          -fn read_certificate(apk: &mut File) -> Vec<u8> {
+          +fn read_certificate(apk: &mut File, min_version_code: i32) -> Vec<u8> {
+          @@ -96 +96 @@ fn read_certificate(apk: &mut File) -> Vec<u8> {
+          -        if MAGISK_VER_CODE > apk_ver {
+          +        if min_version_code > apk_ver {
+          @@ -150 +150 @@ fn read_certificate(apk: &mut File) -> Vec<u8> {
+          -fn find_apk_path() -> Option<Utf8CString> {
+          +fn find_apk_path(pkg: &str) -> Option<Utf8CString> {
+          @@ -157 +157 @@ fn find_apk_path() -> Option<Utf8CString> {
+          -        if name.starts_with(concatcp!(APP_PACKAGE_NAME, "-")) {
+          +        if name.starts_with(pkg) && name.as_bytes().get(pkg.len()) == Some(&b'-') {
+          @@ -211 +211 @@ fn check_apk(tracked: &mut TrackedFile) -> bool {
+          -    let Some(apk) = find_apk_path() else {
+          +    let Some(apk) = find_apk_path(APP_PACKAGE_NAME) else {
+          @@ -216 +216 @@ fn check_apk(tracked: &mut TrackedFile) -> bool {
+          -        Ok(mut fd) => read_certificate(&mut fd),
+          +        Ok(mut fd) => read_certificate(&mut fd, MAGISK_VER_CODE),
+          @@ -232,0 +233,54 @@ fn check_apk(tracked: &mut TrackedFile) -> bool {
+          +// Research-stage native integration only. The repackaged package is NOT authorized
+          +// merely because a database row exists: it must have an installed stub and an
+          +// original-signature-verified dynamic Magisk APK owned by the same Android app.
+          +// Do not accept a repackaged manager in builds without a pinned signing cert.
+          +fn valid_repackaged_pkg(pkg: &str) -> bool {
+          +    if pkg == APP_PACKAGE_NAME || pkg.len() > 200 || pkg.len() < 3 || !pkg.contains('.') {
+          +        return false;
+          +    }
+          +    pkg.split('.').all(|segment| {
+          +        let mut chars = segment.bytes();
+          +        matches!(chars.next(), Some(b'a'..=b'z'))
+          +            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+          +    })
+          +}
+          +
+          +fn check_repackaged_manager(user: i32, pkg: &str) -> Option<i32> {
+          +    // The original APK must be signed with the certificate embedded at build.
+          +    // An unsigned/unpinned research build must never silently grant manager UID.
+          +    if !valid_repackaged_pkg(pkg) || TRUSTED_CERT.is_empty() {
+          +        return None;
+          +    }
+          +
+          +    // Verify this package really has an installed repackaged stub APK.
+          +    let stub = find_apk_path(pkg)?;
+          +    let mut stub_fd = stub.open(OFlag::O_RDONLY | OFlag::O_CLOEXEC).ok()?;
+          +    if read_certificate(&mut stub_fd, -1).is_empty() {
+          +        return None;
+          +    }
+          +
+          +    // The real manager code in the stub's private storage must be Magisk-signed.
+          +    // Do not trust arbitrary data from the requester settings row.
+          +    let uid = get_package_uid(user, pkg);
+          +    if !(AID_APP_START..=AID_APP_END).contains(&to_app_id(uid)) {
+          +        return None;
+          +    }
+          +    let dyn_path = cstr::buf::default()
+          +        .join_path(APP_DATA_DIR)
+          +        .join_path_fmt(user)
+          +        .join_path(pkg)
+          +        .join_path("dyn")
+          +        .join_path("current.apk");
+          +    let mut dyn_fd = dyn_path.open(OFlag::O_RDONLY | OFlag::O_CLOEXEC).ok()?;
+          +    let dyn_owner = fd_get_attr(dyn_fd.as_raw_fd()).ok()?.st.st_uid as i32;
+          +    if dyn_owner != uid {
+          +        return None;
+          +    }
+          +    let cert = read_certificate(&mut dyn_fd, MAGISK_VER_CODE);
+          +    if cert.as_slice() != TRUSTED_CERT {
+          +        error!("pkg: dynamic manager signature mismatch: {}", dyn_path);
+          +        return None;
+          +    }
+          +    Some(uid)
+          +}
+          +
+          @@ -234,0 +289,5 @@ impl MagiskD {
+          +        // Preserve v31.1's original manager lookup as the fallback.
+          +        let pkg = self.get_repackaged_manager_pkg();
+          +        if let Some(uid) = check_repackaged_manager(user, &pkg) {
+          +            return uid;
+          +        }
+          R3_NATIVE_PATCH
+          printf '%s  reports/r3-native.patch\n' 'be9db0343e7f416368851b404a82b5ea21e773bdaaf36c9ba083d6b0e46cf9d2' | sha256sum -c -
+          git -C magisk apply --unidiff-zero --check ../reports/r3-native.patch
+          git -C magisk apply --unidiff-zero ../reports/r3-native.patch
+          cat > reports/r4-app-bridge.patch <<'R4_APP_BRIDGE_PATCH'
+          diff --git a/app/core/build.gradle.kts b/app/core/build.gradle.kts
+          index 1646bb14f..672cc0160 100644
+          --- a/app/core/build.gradle.kts
+          +++ b/app/core/build.gradle.kts
+          @@ -44,0 +45 @@ dependencies {
+          +    implementation(libs.bcpkix)
+          diff --git a/app/core/src/main/java/com/topjohnwu/magisk/core/Config.kt b/app/core/src/main/java/com/topjohnwu/magisk/core/Config.kt
+          index cde22fd93..8f8a4c3fe 100644
+          --- a/app/core/src/main/java/com/topjohnwu/magisk/core/Config.kt
+          +++ b/app/core/src/main/java/com/topjohnwu/magisk/core/Config.kt
+          @@ -7,0 +8,2 @@ import com.topjohnwu.magisk.core.repository.PreferenceConfig
+          +import kotlinx.coroutines.Dispatchers
+          +import kotlinx.coroutines.runBlocking
+          @@ -24,0 +27,2 @@ object Config : PreferenceConfig, DBConfig {
+          +        const val SU_MANAGER = "requester"
+          +        const val KEYSTORE = "keystore"
+          @@ -115,0 +120,11 @@ object Config : PreferenceConfig, DBConfig {
+          +    // Only used from the migration worker, not the UI thread. SQLite failures are fatal.
+          +    // The historical on-disk strings table was removed in DB schema 13; these read
+          +    // the two whitelisted text keys from the existing settings table instead.
+          +    var suManager: String
+          +        get() = runBlocking(Dispatchers.IO) { settingsDB.fetchHideText(Key.SU_MANAGER) }
+          +        set(value) = runBlocking(Dispatchers.IO) { settingsDB.putHideText(Key.SU_MANAGER, value) }
+          +
+          +    var keyStoreRaw: String
+          +        get() = runBlocking(Dispatchers.IO) { settingsDB.fetchHideText(Key.KEYSTORE) }
+          +        set(value) = runBlocking(Dispatchers.IO) { settingsDB.putHideText(Key.KEYSTORE, value) }
+          +
+          diff --git a/app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/ManagerPackageNames.kt b/app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/ManagerPackageNames.kt
+          new file mode 100644
+          index 000000000..3af59b084
+          --- /dev/null
+          +++ b/app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/ManagerPackageNames.kt
+          @@ -0,0 +1,10 @@
+          +package com.topjohnwu.magisk.core.data.magiskdb
+          +
+          +/** Matches the restricted ASCII package format accepted by R3's native manager check. */
+          +object ManagerPackageNames {
+          +    private const val ORIGINAL_MANAGER = "com.topjohnwu.magisk"
+          +    private val VALID = Regex("[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+")
+          +
+          +    fun isCandidate(value: String): Boolean =
+          +        value.length in 3..200 && value != ORIGINAL_MANAGER && VALID.matches(value)
+          +}
+          diff --git a/app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/SettingsDao.kt b/app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/SettingsDao.kt
+          index 6089caf0a..56c08c678 100644
+          --- a/app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/SettingsDao.kt
+          +++ b/app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/SettingsDao.kt
+          @@ -2,0 +3,2 @@ package com.topjohnwu.magisk.core.data.magiskdb
+          +import com.topjohnwu.magisk.core.ktx.await
+          +
+          @@ -19,0 +22,42 @@ class SettingsDao : MagiskDB() {
+          +
+          +    /** Legacy app-hiding storage using the existing v13 settings table.
+          +     *  The requester and keystore keys are the only accepted text entries.
+          +     *  This is a source bridge; it does not itself install or hide an APK.
+          +     */
+          +    suspend fun fetchHideText(key: String): String {
+          +        require(key == "requester" || key == "keystore")
+          +        val query = "SELECT CAST(value AS TEXT) AS value FROM ${Table.SETTINGS} WHERE key=\"$key\" LIMIT 1"
+          +        val out = com.topjohnwu.superuser.Shell.cmd("magisk --sqlite '$query'").await()
+          +        check(out.isSuccess) { "Magisk database read failed for $key" }
+          +        val value = out.out.firstOrNull { it.startsWith("value=") }?.removePrefix("value=").orEmpty()
+          +        validateHideText(key, value)
+          +        return value
+          +    }
+          +
+          +    suspend fun putHideText(key: String, value: String) {
+          +        validateHideText(key, value)
+          +        val query = if (value.isEmpty()) {
+          +            "DELETE FROM ${Table.SETTINGS} WHERE key=\"$key\""
+          +        } else {
+          +            "REPLACE INTO ${Table.SETTINGS} (key,value) VALUES(\"$key\",\"$value\")"
+          +        }
+          +        val result = com.topjohnwu.superuser.Shell.cmd("magisk --sqlite '$query'").await()
+          +        check(result.isSuccess) { "Magisk database write failed for $key" }
+          +        // A failed or ignored write must not permit a manager switch.
+          +        check(fetchHideText(key) == value) { "Magisk database verification failed for $key" }
+          +    }
+          +
+          +    private fun validateHideText(key: String, value: String) {
+          +        when (key) {
+          +            "requester" -> require(value.isEmpty() || ManagerPackageNames.isCandidate(value)) {
+          +                "Invalid repackaged manager package"
+          +            }
+          +            "keystore" -> require(value.length <= 100_000 && value.all {
+          +                it.isAsciiAlphaNumeric() || it == '+' || it == '/' || it == '='
+          +            }) { "Invalid encoded keystore" }
+          +            else -> throw IllegalArgumentException("Unknown Magisk text database key")
+          +        }
+          +    }
+          +
+          +    private fun Char.isAsciiAlphaNumeric(): Boolean =
+          +        this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9'
+          diff --git a/app/gradle/libs.versions.toml b/app/gradle/libs.versions.toml
+          index 0c54f8e7d..33984deb5 100644
+          --- a/app/gradle/libs.versions.toml
+          +++ b/app/gradle/libs.versions.toml
+          @@ -17,0 +18 @@ wire = "7.0.3"
+          +bcpkix = { module = "org.bouncycastle:bcpkix-jdk18on", version = "1.86" }
+          R4_APP_BRIDGE_PATCH
+          printf '%s  reports/r4-app-bridge.patch\n' 'aa8bdb40a37836e0fa3dd1eefd7ae480da600f03b88f9bbc0a648f975d26781a' | sha256sum -c -
+          git -C magisk apply --unidiff-zero --check ../reports/r4-app-bridge.patch
+          git -C magisk apply --unidiff-zero ../reports/r4-app-bridge.patch
+          git -C magisk diff --check
+          python3 - <<'PY_R4_AUDIT'
+          from pathlib import Path
+          root = Path('magisk')
+          p=(root/'native/src/core/package.rs').read_text()
+          d=(root/'native/src/core/db.rs').read_text()
+          c=(root/'app/core/src/main/java/com/topjohnwu/magisk/core/Config.kt').read_text()
+          s=(root/'app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/SettingsDao.kt').read_text()
+          assert 'check_repackaged_manager' in p
+          assert 'TRUSTED_CERT.is_empty()' in p
+          assert 'get_repackaged_manager_pkg()' in p
+          assert "WHERE key='requester'" in d
+          assert 'get() = runBlocking(Dispatchers.IO)' in c
+          assert 'set(value) = runBlocking(Dispatchers.IO)' in c
+          assert 'fun putHideText(' in s and 'fun fetchHideText(' in s
+          assert 'check(fetchHideText(key) == value)' in s
+          assert 'libs.bcpkix' in (root/'app/core/build.gradle.kts').read_text()
+          for n in ('JarMap', 'SignApk', 'ApkSignerV2'):
+            assert (root/f'app/core/src/main/java/com/topjohnwu/magisk/core/signing/{n}.java').exists()
+          print('R3+R4 cross-component source validation: PASS')
+          PY_R4_AUDIT
+          git -C magisk diff --stat > reports/applied_source_stats.txt
+          git -C magisk diff --binary > reports/reviewed_core_changes.diff
+
+      - name: Restore pinned historical Stub APK build and asset embed (R5)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > r5_restore.py <<'R5_PY_SOURCE'
+          #!/usr/bin/env python3
+          """R5: restore historical stub build and package it as an asset on Magisk 31.1.
+
+          Research-only, no device changes, no live root manager switching. Pinned upstream
+          sources, source diff and tests are reproducible. The app-hide UI is NOT present.
+          """
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          BASE = '0972f67d97f9b6302b67c5171283330c74114b4a'
+          OLD = 'ea16c8141eb64dc28b56a0e7fb536689ef465429'
+
+
+          def git(repo, *args):
+              return subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, check=True).stdout
+
+
+          def replace_once(path, before, after):
+              text = path.read_text()
+              if text.count(before) != 1:
+                  raise AssertionError(f'{path}: expected exactly one patch anchor, got {text.count(before)}: {before[:80]}')
+              path.write_text(text.replace(before, after, 1))
+
+
+          def apply(repo):
+              repo = Path(repo).resolve()
+              assert git(repo, 'rev-parse', 'HEAD').strip() == BASE, 'Wrong Magisk 31.1 source SHA'
+              assert 'check_repackaged_manager' in (repo/'native/src/core/package.rs').read_text(), 'Apply R3 first'
+              assert 'fetchHideText' in (repo/'app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/SettingsDao.kt').read_text(), 'Apply R4 first'
+              assert not (repo/'app/stub').exists(), 'Not an original v31.1 tree (stub already restored)'
+              assert git(repo, 'cat-file', '-t', OLD).strip() == 'commit', 'Missing complete upstream Git history'
+
+              # Restore only historical stub-specific modules and generator. Don't revert
+              # the modern UI, modern database or newer root authorization policies.
+              git(repo, 'restore', '--source', OLD, '--worktree', '--',
+                  'app/stub', 'app/stub-res', 'app/shared',
+                  'app/build-logic/src/main/java/Stub.kt')
+
+              gradle = repo/'app/settings.gradle.kts'
+              replace_once(gradle, 'include(":apk", ":core", ":test")',
+                           'include(":apk", ":core", ":shared", ":stub", ":stub-res", ":test")')
+
+              plugins = repo/'app/build.gradle.kts'
+              replace_once(plugins, '    alias(libs.plugins.moshix) apply false',
+                           '    alias(libs.plugins.lsparanoid) apply false\n    alias(libs.plugins.moshix) apply false')
+
+              libs = repo/'app/gradle/libs.versions.toml'
+              replace_once(libs, 'moshix = { id = "dev.zacsweers.moshix", version = "0.37.0" }',
+                           'lsparanoid = { id = "org.lsposed.lsparanoid", version = "0.6.0" }\nmoshix = { id = "dev.zacsweers.moshix", version = "0.37.0" }')
+
+              props = repo/'app/gradle.properties'
+              replace_once(props, 'magisk.versionCode=31100', 'magisk.stubVersion=41\nmagisk.versionCode=31100')
+
+              plugin = repo/'app/build-logic/src/main/java/Plugin.kt'
+              replace_once(plugin, 'import java.util.Properties\n',
+                           'import java.util.Properties\nimport java.util.Random\n\n'
+                           '// R5 stub class names are stable on GitHub CI, random elsewhere.\n'
+                           'val RAND_SEED = if (System.getenv("CI") != null) 42 else 0\n'
+                           'lateinit var RANDOM: Random\n')
+              replace_once(plugin, '    val versionCode: Int get() = get("magisk.versionCode")!!.toInt()\n',
+                           '    val versionCode: Int get() = get("magisk.versionCode")!!.toInt()\n'
+                           '    val stubVersion: String get() = get("magisk.stubVersion")!!\n')
+              replace_once(plugin, '    private fun Project.applyPlugin() {\n',
+                           '    private fun Project.applyPlugin() {\n'
+                           '        initRandom(rootProject.file("dict.txt"))\n')
+
+              setup = repo/'app/build-logic/src/main/java/Setup.kt'
+              replace_once(setup, '            val syncAssets = tasks.register("sync${variantCapped}Assets", SyncWithDir::class) {',
+                           '            val stubTask = tasks.getByPath(":stub:transform${variantCapped}Apk")\n'
+                           '            val syncAssets = tasks.register("sync${variantCapped}Assets", SyncWithDir::class) {')
+              replace_once(setup, '                filesMatching("**/util_functions.sh") {',
+                           '                from(stubTask) {\n'
+                           '                    include { it.name.endsWith(".apk") }\n'
+                           '                    rename { "stub.apk" }\n'
+                           '                }\n'
+                           '                filesMatching("**/util_functions.sh") {')
+              replace_once(setup, '"versionCode=${Config.versionCode}\\n").toByteArray()',
+                           '"versionCode=${Config.versionCode}\\n" +\n'
+                           '                            "stubVersion=${Config.stubVersion}\\n").toByteArray()')
+
+              # Old stub APK's asset is required by the future migration component.  No
+              # launch UI and no installation are enabled at this stage.
+              assert 'from(stubTask)' in setup.read_text()
+              assert (repo/'app/stub/src/main/java/com/topjohnwu/magisk/DynLoad.java').is_file()
+              assert (repo/'app/shared/src/main/java/com/topjohnwu/magisk/StubApk.java').is_file()
+              assert 'magisk.versionCode=31100' in props.read_text()
+              assert git(repo, 'diff', '--check') == ''
+
+              print('R5 upstream stub modules, asset integration and 31.1 integrity: PASS')
+
+          if __name__ == '__main__':
+              if len(sys.argv) != 2:
+                  print('Usage: apply_r5.py /path/to/magisk', file=sys.stderr)
+                  sys.exit(2)
+              apply(sys.argv[1])
+          R5_PY_SOURCE
+          python3 r5_restore.py magisk
+          git -C magisk diff --check
+          git -C magisk status --short > reports/R5_source_status.txt
+          git -C magisk diff --binary > reports/R5_final_tracked_changes.diff
+          git -C magisk diff --stat > reports/R5_final_tracked_summary.txt
+          # Restore only tracks known upstream git objects; no downloaded patch blob.
+          git -C magisk ls-tree -r --name-only ea16c8141eb64dc28b56a0e7fb536689ef465429 app/stub app/stub-res app/shared > reports/R5_restored_historical_paths.txt
+          wc -l < reports/R5_restored_historical_paths.txt > reports/R5_historical_file_count.txt
+          python3 - <<'R5_STATIC'
+          from pathlib import Path
+          import tomllib
+          from xml.etree import ElementTree
+          p=Path('magisk')
+          assert 'magisk.stubVersion=41' in (p/'app/gradle.properties').read_text()
+          assert 'stub.apk' in (p/'app/build-logic/src/main/java/Setup.kt').read_text()
+          assert 'setupStubApk()' in (p/'app/stub/build.gradle.kts').read_text()
+          assert 'app/stub-res' in (p/'app/build-logic/src/main/java/Stub.kt').read_text() or ':stub-res' in (p/'app/build-logic/src/main/java/Stub.kt').read_text()
+          assert 'initRandom(rootProject.file("dict.txt"))' in (p/'app/build-logic/src/main/java/Plugin.kt').read_text()
+          config=tomllib.loads((p/'app/gradle/libs.versions.toml').read_text())
+          assert config['plugins']['lsparanoid']['version']=='0.6.0'
+          assert 'getDynDir(info)' in (p/'app/shared/src/main/java/com/topjohnwu/magisk/StubApk.java').read_text()
+          assert '"/data/user_de"' in (p/'native/src/include/consts.rs').read_text()
+          xmls=list((p/'app/stub').rglob('*.xml'))+list((p/'app/stub-res').rglob('*.xml'))
+          for x in xmls: ElementTree.parse(x)
+          print(f'R5 stub topology and {len(xmls)} XML resources PASS')
+          R5_STATIC
+
+      - name: Integrate historical app migration and v31.1 Compose UI (R6)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > r6_migration.py <<'R6_VERIFIED_SOURCE'
+          #!/usr/bin/env python3
+          """R6: recover historical Magisk app migration and bridge it with v31.1 Compose UI.
+
+          Source-only research. Applies to Magisk 31.1 after the R3/R4/R5 restore.
+          No device operations are executed by this script; they are in Android source only.
+          """
+          from pathlib import Path
+          import subprocess
+          import sys
+          import re
+
+          BASE='0972f67d97f9b6302b67c5171283330c74114b4a'
+          OLD='ea16c8141eb64dc28b56a0e7fb536689ef465429'
+
+
+          def git(root,*args):
+              return subprocess.run(['git','-C',str(root),*args],check=True,text=True,capture_output=True).stdout
+
+
+          def replace_once(path,before,after):
+              content=path.read_text()
+              count=content.count(before)
+              if count != 1:
+                  raise AssertionError(f'R6 {path} anchor expected once, got {count}: {before[:110]!r}')
+              path.write_text(content.replace(before,after,1))
+
+
+          def section_replace(path,start_marker,end_marker,text):
+              data=path.read_text()
+              assert data.count(start_marker)==1, (path,start_marker)
+              assert data.count(end_marker)==1, (path,end_marker)
+              first=data.index(start_marker)
+              last=data.index(end_marker,first)
+              path.write_text(data[:first]+text+data[last:])
+
+
+          def apply(repo):
+              repo=Path(repo).resolve()
+              assert git(repo,'rev-parse','HEAD').strip()==BASE
+              assert (repo/'app/stub/src/main/java/com/topjohnwu/magisk/DynLoad.java').is_file(), 'R5 required'
+              assert 'get_repackaged_manager_pkg' in (repo/'native/src/core/db.rs').read_text(), 'R3 required'
+              assert 'fun putHideText(' in (repo/'app/core/src/main/java/com/topjohnwu/magisk/core/data/magiskdb/SettingsDao.kt').read_text(), 'R4 required'
+              assert 'from(stubTask)' in (repo/'app/build-logic/src/main/java/Setup.kt').read_text(), 'R5 asset required'
+
+              # The v31.0 migration implementation is restored from an exact Git object,
+              # not an unverified download.  Adjust only changed v31.1 contracts.
+              migration_path='app/core/src/main/java/com/topjohnwu/magisk/core/tasks/AppMigration.kt'
+              migration=repo/migration_path
+              assert not migration.exists(), 'R6 already applied'
+              migration.parent.mkdir(parents=True,exist_ok=True)
+              migration.write_text(git(repo,'show',f'{OLD}:{migration_path}'))
+              replace_once(migration, 'import com.topjohnwu.magisk.core.Const\n','import com.topjohnwu.magisk.core.Info\nimport com.topjohnwu.magisk.core.isRunningAsStub\nimport com.topjohnwu.magisk.core.data.magiskdb.ManagerPackageNames\n')
+              replace_once(migration, 'import android.widget.Toast\n','')
+              replace_once(migration, 'import com.topjohnwu.magisk.core.R\n','')
+              replace_once(migration, 'import com.topjohnwu.magisk.core.ktx.toast\n','')
+              replace_once(migration, 'import java.io.IOException\n','import java.io.IOException\n')
+
+              # Generate only valid ASCII package identifiers allowed by native R3 and R4.
+              section_replace(migration,'    private fun genPackageName(): String {','    private fun classNameGenerator() = sequence {', '''    private fun genPackageName(): String {
+                  val random = SecureRandom()
+                  val count = 2 + random.nextInt(2)
+                  return (0 until count).joinToString(".") {
+                      val n = 4 + random.nextInt(5)
+                      buildString {
+                          append(ALPHA[random.nextInt(ALPHA.length)])
+                          repeat(n - 1) { append(ALPHA[random.nextInt(ALPHA.length)]) }
+                      }
+                  }
+              }
+
+          ''')
+              replace_once(migration, '    private const val ALPHADOTS = "$ALPHA....."\n','')
+
+              # Stop passing the pre-31.1 Config Parcelable; the new Config has no
+              # toBundle()/PREV_CONFIG.  Settings are already persisted to Magisk DB.
+              section_replace(migration, '    private fun launchApp(context: Context, pkg: String) {','    suspend fun patchAndHide(context: Context, label: String, pkg: String? = null): Boolean {', '''    private fun launchApp(context: Context, pkg: String): Boolean {
+                  return try {
+                      val intent = context.packageManager.getLaunchIntentForPackage(pkg) ?: return false
+                      if (context !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      val options = ActivityOptions.makeBasic()
+                      if (Build.VERSION.SDK_INT >= 34) options.setShareIdentityEnabled(true)
+                      context.startActivity(intent, options.toBundle())
+                      if (context is Activity) context.finish()
+                      true
+                  } catch (e: Exception) {
+                      Timber.e(e, "Failed to launch migrated manager")
+                      false
+                  }
+              }
+
+          ''')
+
+              # The old flow could update requester before verifying install, and mixed
+              # blocking root calls into main thread.  R6 runs mutation off main, then
+              # launches only on the main dispatcher. The original app remains installed
+              # as fallback (no uninstall on failure).
+              section_replace(migration,'    suspend fun patchAndHide(context: Context, label: String, pkg: String? = null): Boolean {','    suspend fun restoreApp(context: Context): Boolean {', '''    suspend fun patchAndHide(context: Context, label: String, pkg: String? = null): Boolean {
+                  if (context.packageName != APP_PACKAGE_NAME || isRunningAsStub || !Info.env.isActive) return false
+                  if (label.isBlank() || label.length > MAX_LABEL_LENGTH || label.any(Char::isISOControl)) return false
+                  val target = pkg ?: genPackageName()
+                  if (!ManagerPackageNames.isCandidate(target)) return false
+
+                  val installed = withContext(Dispatchers.IO) {
+                      try {
+                          val stub = File(context.cacheDir, "stub.apk")
+                          context.assets.open("stub.apk").writeTo(stub)
+
+                          // If a package name is already taken, do not overwrite its APK.
+                          val alreadyPresent = try {
+                              context.packageManager.getApplicationInfo(target, 0)
+                              true
+                          } catch (_: PackageManager.NameNotFoundException) {
+                              false
+                          }
+                          if (alreadyPresent) return@withContext false
+
+                          Config.keyStoreRaw = "" // Fresh per-migration signing key.
+                          val repack = File(context.cacheDir, "patched-$target.apk")
+                          val signed = repack.outputStream().use { patch(context, stub, it, target, label) }
+                          if (!signed) return@withContext false
+                          if (!Shell.cmd("adb_pm_install $repack $target").await().isSuccess) return@withContext false
+                          try {
+                              context.packageManager.getApplicationInfo(target, 0)
+                          } catch (_: PackageManager.NameNotFoundException) {
+                              return@withContext false
+                          }
+
+                          // Commit the manager switch only after installation succeeds.
+                          // Native R3 still validates both package UID and signed dynamic APK.
+                          Config.suManager = target
+                          Shell.cmd("touch $AppApkPath").await()
+                          true
+                      } catch (e: Exception) {
+                          Timber.e(e, "Failed to prepare or install repackaged manager")
+                          false
+                      }
+                  }
+                  if (!installed) return false
+                  if (launchApp(context, target)) return true
+                  // A failed launch must not strand root permissions on an unusable manager.
+                  withContext(Dispatchers.IO) {
+                      runCatching { Config.suManager = "" }.onFailure { Timber.e(it, "Manager switch rollback failed") }
+                  }
+                  return false
+              }
+
+          ''')
+              section_replace(migration,'    suspend fun restoreApp(context: Context): Boolean {','    suspend fun upgradeStub(context: Context, apk: File): Intent? {','''    suspend fun restoreApp(context: Context): Boolean {
+                  if (!isRunningAsStub || context.packageName == APP_PACKAGE_NAME || !Info.env.isActive) return false
+                  val installed = withContext(Dispatchers.IO) {
+                      try {
+                          val apk = StubApk.current(context)
+                          if (!apk.isFile || apk.length() == 0L) return@withContext false
+                          if (!Shell.cmd("adb_pm_install $apk $APP_PACKAGE_NAME").await().isSuccess) return@withContext false
+                          Config.suManager = ""
+                          Shell.cmd("touch $AppApkPath").await()
+                          true
+                      } catch (e: Exception) {
+                          Timber.e(e, "Failed to restore original manager")
+                          false
+                      }
+                  }
+                  return installed && launchApp(context, APP_PACKAGE_NAME)
+              }
+
+          ''')
+
+              # Source snapshot's hidden-loader App needs the historic constructor(Object)
+              # and has to attach an Application context from the stub.
+              app=repo/'app/core/src/main/java/com/topjohnwu/magisk/core/App.kt'
+              app.write_text('''package com.topjohnwu.magisk.core
+
+          import android.app.Application
+          import android.content.Context
+          import com.topjohnwu.magisk.StubApk
+          import com.topjohnwu.magisk.core.utils.RootUtils
+
+          open class App() : Application() {
+              constructor(rawStubData: Any) : this() {
+                  val data = StubApk.Data(rawStubData)
+                  data.classToComponent[RootUtils::class.java.name] = data.rootService.name
+                  data.rootService = RootUtils::class.java
+                  Info.stub = data
+              }
+
+              override fun attachBaseContext(context: Context) {
+                  if (context is Application) {
+                      AppContext.attachApplication(context)
+                  } else {
+                      super.attachBaseContext(context)
+                      AppContext.attachApplication(this)
+                  }
+              }
+          }
+          ''')
+              info=repo/'app/core/src/main/java/com/topjohnwu/magisk/core/Info.kt'
+              replace_once(info,'import androidx.lifecycle.MutableLiveData\n','import androidx.lifecycle.MutableLiveData\nimport com.topjohnwu.magisk.StubApk\n')
+              replace_once(info,'object Info {\n','val isRunningAsStub get() = Info.stub != null\n\nobject Info {\n    var stub: StubApk.Data? = null\n')
+              context=repo/'app/core/src/main/java/com/topjohnwu/magisk/core/AppContext.kt'
+              replace_once(context,'import androidx.profileinstaller.ProfileInstaller\n','import androidx.profileinstaller.ProfileInstaller\nimport com.topjohnwu.magisk.StubApk\n')
+              replace_once(context,'        AppApkPath = base.packageResourcePath\n', '''        AppApkPath = if (isRunningAsStub) {
+                      StubApk.current(base).path
+                  } else {
+                      base.packageResourcePath
+                  }
+          ''')
+
+              # Compose home screen: explicit confirmation and progress. Button gated on
+              # active v31.1 environment, no auto-migration on startup.
+              home=repo/'app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeScreen.kt'
+              replace_once(home,'import androidx.compose.material.icons.filled.Security\n','import androidx.compose.material.icons.filled.Security\nimport androidx.compose.material.icons.filled.Visibility\nimport androidx.compose.material.icons.filled.VisibilityOff\n')
+              replace_once(home,'import androidx.compose.material3.MaterialTheme\n','import androidx.compose.material3.MaterialTheme\nimport androidx.compose.material3.OutlinedTextField\n')
+              replace_once(home,'import com.topjohnwu.magisk.core.Info\n','import com.topjohnwu.magisk.core.Info\nimport com.topjohnwu.magisk.core.isRunningAsStub\n')
+              replace_once(home,'import com.topjohnwu.magisk.core.model.UpdateInfo\n','import com.topjohnwu.magisk.core.model.UpdateInfo\nimport com.topjohnwu.magisk.core.tasks.AppMigration\n')
+              replace_once(home,'    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()\n','    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()\n    val migrationScope = rememberCoroutineScope()\n    var migrationBusy by remember { mutableStateOf(false) }\n    var showHideDialog by rememberSaveable { mutableStateOf(false) }\n    var showRestoreDialog by rememberSaveable { mutableStateOf(false) }\n')
+              replace_once(home,'    LoadingDialog(visible = uiState.showLoading)\n','    LoadingDialog(visible = uiState.showLoading)\n')
+              replace_once(home,'    val scrollState = rememberScrollState()\n', '''    if (showHideDialog) {
+                  HideAppDialog(
+                      onDismiss = { showHideDialog = false },
+                      onConfirm = { label ->
+                          showHideDialog = false
+                          viewModel.hideManager(label)
+                      }
+                  )
+              }
+              if (showRestoreDialog) {
+                  RestoreAppDialog(
+                      onDismiss = { showRestoreDialog = false },
+                      onConfirm = {
+                          showRestoreDialog = false
+                          viewModel.restoreManager()
+                      }
+                  )
+              }
+
+              val scrollState = rememberScrollState()
+          ''')
+              replace_once(home,'                    progress = uiState.managerProgress,\n                    onManagerPressed = viewModel::onManagerPressed,','''                    progress = uiState.managerProgress,
+                              isHidden = isRunningAsStub,
+                              onManagerPressed = viewModel::onManagerPressed,
+                              onHideRestorePressed = {
+                                  if (!uiState.showLoading) {
+                                      if (isRunningAsStub) showRestoreDialog = true else showHideDialog = true
+                                  }
+                              },''')
+              replace_once(home,'    progress: Int,\n    onManagerPressed: () -> Unit,','    progress: Int,\n    isHidden: Boolean,\n    onManagerPressed: () -> Unit,\n    onHideRestorePressed: () -> Unit,')
+              needle='''                if (actionLabel != null) {
+                              InstallButton(
+                                  label = actionLabel,
+                                  onClick = onManagerPressed,
+                              )
+                          }
+          '''
+              replacement='''                Row(verticalAlignment = Alignment.CenterVertically) {
+                              if (Info.env.isActive && Info.env.versionCode == BuildConfig.APP_VERSION_CODE) {
+                                  IconButton(onClick = onHideRestorePressed) {
+                                      Icon(
+                                          imageVector = if (isHidden) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                          contentDescription = stringResource(
+                                              if (isHidden) CoreR.string.settings_restore_app_title
+                                              else CoreR.string.settings_hide_app_title
+                                          ),
+                                          modifier = Modifier.size(20.dp),
+                                      )
+                                  }
+                              }
+                              if (actionLabel != null) {
+                                  Spacer(Modifier.width(4.dp))
+                                  InstallButton(label = actionLabel, onClick = onManagerPressed)
+                              }
+                          }
+          '''
+              replace_once(home,needle,replacement)
+              home.write_text(home.read_text()+'''
+
+          @Composable
+          private fun HideAppDialog(
+              onDismiss: () -> Unit,
+              onConfirm: (String) -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              val defaultName = stringResource(CoreR.string.settings)
+              var appName by rememberSaveable { mutableStateOf(defaultName) }
+              val invalid = appName.isBlank() || appName.length > AppMigration.MAX_LABEL_LENGTH
+              MagiskDialog(
+                  modifier = modifier,
+                  onDismissRequest = onDismiss,
+                  title = stringResource(CoreR.string.settings_hide_app_title),
+                  confirmText = stringResource(android.R.string.ok),
+                  onConfirm = { if (!invalid) onConfirm(appName) },
+                  confirmEnabled = !invalid,
+                  dismissText = stringResource(android.R.string.cancel),
+                  onDismiss = onDismiss,
+              ) {
+                  Column(modifier = Modifier.padding(top = 8.dp)) {
+                      OutlinedTextField(
+                          value = appName,
+                          onValueChange = { appName = it },
+                          modifier = Modifier.fillMaxWidth(),
+                          label = { Text(stringResource(CoreR.string.settings_app_name_hint)) },
+                          isError = invalid,
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun RestoreAppDialog(
+              onDismiss: () -> Unit,
+              onConfirm: () -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              MagiskDialog(
+                  modifier = modifier,
+                  onDismissRequest = onDismiss,
+                  title = stringResource(CoreR.string.settings_restore_app_title),
+                  confirmText = stringResource(android.R.string.ok),
+                  onConfirm = onConfirm,
+                  dismissText = stringResource(android.R.string.cancel),
+                  onDismiss = onDismiss,
+              ) {
+                  Text(stringResource(CoreR.string.restore_app_confirmation))
+              }
+          }
+          ''')
+
+              # Mutations live in the existing activity-scoped ViewModel, so rotation or
+              # closing a Compose sheet does not cancel an ongoing root transaction.
+              vm=repo/'app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeViewModel.kt'
+              replace_once(vm,'import com.topjohnwu.magisk.core.tasks.MagiskInstaller\n',
+                           'import com.topjohnwu.magisk.core.tasks.MagiskInstaller\nimport com.topjohnwu.magisk.core.tasks.AppMigration\n')
+              replace_once(vm,'    fun fixEnv() {\n','''    fun hideManager(label: String) {
+                  if (_uiState.value.showLoading) return
+                  viewModelScope.launch {
+                      val success = try {
+                          withLoading {
+                              val context = AppContext.foregroundActivity ?: AppContext
+                              AppMigration.patchAndHide(context, label)
+                          }
+                      } catch (e: Exception) {
+                          false
+                      }
+                      if (!success) showToast(CoreR.string.failure)
+                  }
+              }
+
+              fun restoreManager() {
+                  if (_uiState.value.showLoading) return
+                  viewModelScope.launch {
+                      val success = try {
+                          withLoading {
+                              val context = AppContext.foregroundActivity ?: AppContext
+                              AppMigration.restoreApp(context)
+                          }
+                      } catch (e: Exception) {
+                          false
+                      }
+                      if (!success) showToast(CoreR.string.failure)
+                  }
+              }
+
+              fun fixEnv() {
+          ''')
+
+              # Add English strings. Other locales fall back to the original source's
+              # English resources; do not overwrite translation files.
+              strings=repo/'app/core/src/main/res/values/strings.xml'
+              for name in ['settings_hide_app_title','settings_restore_app_title','settings_app_name_hint','restore_app_confirmation']:
+                  assert f'name="{name}"' not in strings.read_text(), name
+              replace_once(strings,'</resources>', '''    <string name="settings_hide_app_title">Hide the Magisk app</string>
+              <string name="settings_restore_app_title">Restore the Magisk app</string>
+              <string name="settings_app_name_hint">New name</string>
+              <string name="restore_app_confirmation">Restore the hidden manager to its original package?</string>
+          </resources>''')
+
+              # The dynamic stub reflects on App(Object).  R8 must not strip or rename it.
+              proguard=repo/'app/core/proguard-rules.pro'
+              replace_once(proguard,'# Strip Timber verbose and debug logging',
+                           '# Keep the historical stub-facing Application constructor used via reflection.\n'
+                           '-keep class com.topjohnwu.magisk.core.App { <init>(java.lang.Object); }\n\n'
+                           '# Strip Timber verbose and debug logging')
+
+              # Restore only four official historical German translations (English
+              # values above serve as fallback for all other existing translations).
+              german=repo/'app/core/src/main/res/values-de/strings.xml'
+              old_german=git(repo,'show',f'{OLD}:app/core/src/main/res/values-de/strings.xml')
+              labels=('settings_hide_app_title','settings_restore_app_title','settings_app_name_hint','restore_app_confirmation')
+              original=german.read_text()
+              translations=[]
+              for key in labels:
+                  assert f'name="{key}"' not in original
+                  found=re.search(r'^\s*<string name="'+re.escape(key)+r'">.*</string>\s*$',old_german,re.M)
+                  assert found, f'Authentic translation missing for {key}'
+                  translations.append(found.group(0).strip())
+              replace_once(german,'</resources>',
+                           ''.join('    '+val+'\n' for val in translations)+'</resources>')
+
+              # Build gate: retained JNI and signing paths, no original version changes.
+              assert 'magisk.versionCode=31100' in (repo/'app/gradle.properties').read_text()
+              assert 'check_repackaged_manager' in (repo/'native/src/core/package.rs').read_text()
+              assert 'Info.stub = data' in app.read_text()
+              assert 'StubApk.current(base).path' in context.read_text()
+              assert 'assets.open("stub.apk")' in migration.read_text()
+              assert 'viewModel.hideManager(label)' in home.read_text()
+              assert 'viewModel.restoreManager()' in home.read_text()
+              assert git(repo,'diff','--check')==''
+              print('R6 migration, dynamic Application bridge and Compose UI: SOURCE PASS')
+
+          if __name__=='__main__':
+              if len(sys.argv)!=2:
+                  sys.exit('usage: apply_r6.py <Magisk 31.1 checkout after R5>')
+              apply(sys.argv[1])
+          R6_VERIFIED_SOURCE
+          printf '%s  r6_migration.py\n' 'a063bd2664f38d825325610ef48c075088e2b23cf33e4e5b2a469eae4c79314b' | sha256sum -c -
+          python3 r6_migration.py magisk
+          git -C magisk diff --check
+          git -C magisk diff --binary > reports/R6_tracked_source.diff
+          git -C magisk diff --stat > reports/R6_tracked_stats.txt
+          git -C magisk status --short > reports/R6_source_status.txt
+          sha256sum \
+            magisk/app/core/src/main/java/com/topjohnwu/magisk/core/tasks/AppMigration.kt \
+            magisk/app/core/src/main/java/com/topjohnwu/magisk/core/App.kt \
+            magisk/app/core/src/main/java/com/topjohnwu/magisk/core/AppContext.kt \
+            magisk/app/core/src/main/java/com/topjohnwu/magisk/core/Info.kt \
+            magisk/app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeScreen.kt \
+            magisk/app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeViewModel.kt \
+            magisk/app/core/src/main/res/values/strings.xml > reports/R6_source_SHA256SUMS.txt
+
+      - name: Verify complete R6 source bridge, rollback and resource contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'R6_CONTRACTS'
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          m=Path('magisk')
+          read=lambda p:(m/p).read_text()
+          migration=read('app/core/src/main/java/com/topjohnwu/magisk/core/tasks/AppMigration.kt')
+          app=read('app/core/src/main/java/com/topjohnwu/magisk/core/App.kt')
+          ctx=read('app/core/src/main/java/com/topjohnwu/magisk/core/AppContext.kt')
+          info=read('app/core/src/main/java/com/topjohnwu/magisk/core/Info.kt')
+          vm=read('app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeViewModel.kt')
+          ui=read('app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeScreen.kt')
+          assert 'constructor(rawStubData: Any)' in app
+          assert 'Info.stub = data' in app
+          assert 'StubApk.current(base).path' in ctx
+          assert 'val isRunningAsStub' in info
+          assert 'if (!Shell.cmd("adb_pm_install $repack $target").await().isSuccess)' in migration
+          assert 'Config.suManager = target' in migration
+          assert migration.index('adb_pm_install $repack') < migration.index('Config.suManager = target')
+          assert 'runCatching { Config.suManager = "" }' in migration
+          assert 'PackageManager.NameNotFoundException' in migration
+          assert 'suspend fun restoreApp' in migration
+          assert 'fun hideManager(label: String)' in vm and 'fun restoreManager()' in vm
+          assert 'viewModelScope.launch' in vm
+          assert 'HideAppDialog(' in ui and 'RestoreAppDialog(' in ui
+          assert 'AppMigration.patchAndHide' not in ui
+          assert 'Config.toBundle()' not in migration
+          assert 'dbStrings(Key.SU_MANAGER' not in read('app/core/src/main/java/com/topjohnwu/magisk/core/Config.kt')
+          assert 'get_repackaged_manager_pkg' in read('native/src/core/db.rs')
+          assert (m/'app/stub/src/main/java/com/topjohnwu/magisk/DynLoad.java').is_file()
+          assert 'from(stubTask)' in read('app/build-logic/src/main/java/Setup.kt')
+          root=ET.parse(m/'app/core/src/main/res/values/strings.xml').getroot()
+          names={e.get('name') for e in root if e.tag=='string'}
+          assert {'settings_hide_app_title','settings_restore_app_title','settings_app_name_hint','restore_app_confirmation'} <= names
+          print('R6 source, transaction ordering, app class loader, UI and XML contracts: PASS')
+          R6_CONTRACTS
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Obtain official Magisk ONDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd magisk && python3 build.py -v ndk) 2>&1 | tee reports/ondk.log
+
+      - name: Generate throwaway R6 CI signing certificate (never distribute)
+        shell: bash
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -noprompt \
+            -keystore "$GITHUB_WORKSPACE/magisk/r6-ci-only.p12" -storetype PKCS12 \
+            -storepass 'R6-Test-Only' -keypass 'R6-Test-Only' \
+            -alias r6-research -keyalg RSA -keysize 3072 -validity 2 \
+            -dname 'CN=Disposable R6 Research Build, O=Local CI, C=DE' >/dev/null
+          cat > r6-build.prop <<EOF
+          abiList=arm64-v8a,armeabi-v7a
+          keyStore=$GITHUB_WORKSPACE/magisk/r6-ci-only.p12
+          keyStorePass=R6-Test-Only
+          keyPass=R6-Test-Only
+          keyAlias=r6-research
+          EOF
+          keytool -list -keystore "$GITHUB_WORKSPACE/magisk/r6-ci-only.p12" -storepass 'R6-Test-Only' -alias r6-research >/dev/null
+
+      - name: Compile signed research Magisk 31.1 with R6 migration and stub.apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd magisk && python3 build.py -vr -c ../r6-build.prop all) 2>&1 | tee reports/full_build.log
+          python3 - <<'PY_VERIFY'
+          import hashlib, pathlib, zipfile
+          root=pathlib.Path('magisk/out')
+          apk=root/'app-release.apk'
+          assert apk.is_file() and apk.stat().st_size>1_000_000
+          with zipfile.ZipFile(apk) as z:
+            assert z.testzip() is None
+            dex=[n for n in z.namelist() if n.startswith('classes') and n.endswith('.dex')]
+            assert dex
+          with zipfile.ZipFile(apk) as z:
+            names=z.namelist()
+            assert 'assets/stub.apk' in names, 'Stub APK was not packaged in Magisk manager'
+            from io import BytesIO
+            with zipfile.ZipFile(BytesIO(z.read('assets/stub.apk'))) as stub:
+              assert stub.testzip() is None
+              assert 'AndroidManifest.xml' in stub.namelist()
+              assert 'classes.dex' in stub.namelist()
+          flags=(pathlib.Path('magisk/native/out/generated/flags.rs')).read_text()
+          assert 'TRUSTED_CERT' in flags
+          import re
+          cert=re.search(r'TRUSTED_CERT:.*?= &\[(.*?)\];',flags,re.S)
+          assert cert and len(re.findall('0x[0-9a-f]{2}', cert.group(1)))>100, 'Trusted cert missing in native build'
+          sha=hashlib.sha256(apk.read_bytes()).hexdigest()
+          pathlib.Path('reports/app-release-sha256.txt').write_text(f'{sha}  app-release.apk\n')
+          pathlib.Path('reports/BUILD_STATUS.txt').write_text(
+            'R6 native ARM64/ARM32, Android APK and nested stub.apk built.\n'
+            'R6 AppMigration and Compose UI compiled, but runtime migration still UNTESTED.\n'
+            'DO NOT INSTALL OR FLASH THIS EXPERIMENTAL RESEARCH FORK.\n'
+          )
+          print('R6 stub.apk, app migration UI and native trusted certificate compiled PASS; research-only')
+          PY_VERIFY
+
+      - name: Upload compiler and source evidence only (no APK, no signing key)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: R6_MIGRATION_UI_COMPILER_EVIDENCE_DO_NOT_FLASH
+          path: reports/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,7 +1,7 @@
-name: Magisk Manager-Hide - Clean Source Recovery
+name: Magisk Manager-Hide R3 - Native Compile Gate
 
-# Read-only source recovery: never installs, flashes, or claims a working backport.
-# This workflow deliberately does not use the old main.zip or hidden YAML archives.
+# SOURCE-ONLY verification. No APK installation, flashing or phone interaction.
+# This is an official Magisk v31.1 research fork, not Magisk Alpha 31100.
 on:
   workflow_dispatch:
 
@@ -9,112 +9,262 @@ permissions:
   contents: read
 
 jobs:
-  recover-source:
-    name: Fetch authentic 31.1 history and check all 8 removals
+  native-compile-gate:
+    name: Apply targeted native patch and compile arm64 + arm32
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 90
     steps:
-      - name: Get exact Magisk 31.1 with complete Git history
+      - name: Checkout exact original Magisk 31.1 with submodules
         uses: actions/checkout@v6
         with:
           repository: topjohnwu/Magisk
           ref: 0972f67d97f9b6302b67c5171283330c74114b4a
+          fetch-depth: 1
+          submodules: recursive
           path: magisk
-          fetch-depth: 0
-          submodules: false
           persist-credentials: false
 
-      - name: Validate pinned upstream source
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd magisk
-          base=0972f67d97f9b6302b67c5171283330c74114b4a
-          test "$(git rev-parse HEAD)" = "$base"
-          git merge-base --is-ancestor ea16c8141eb64dc28b56a0e7fb536689ef465429 HEAD
-          for sha in \
-            e31ef291d401faa21c20fb791c38f1e60bedfa2e \
-            d22fea290654dcf7bad9128f79834535ee3f47c3 \
-            c86a8776cee88689dd684ec1dd7d584d77540110 \
-            447a8f9965198f32a125b6c2c33644ca9604976e \
-            5f2faee61879859004acb34811051f45d51a5191 \
-            7d9b0dfb3e58ab0959021533e0d19ba362b766a7 \
-            1240c2e35ca3f232d7a125238a33e634e9ab3231 \
-            58477458401a298c02604b99caf5afcdb9ed9e3f; do
-            test "$(git cat-file -t "$sha")" = commit
-            git merge-base --is-ancestor "$sha" "$base"
-          done
-
-      - name: Package complete Git history for offline repair
+      - name: Apply reviewed two-file native manager patch
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p reports
-          git -C magisk bundle create "$GITHUB_WORKSPACE/reports/Magisk_v31.1_history.bundle" HEAD
-          git -C magisk bundle verify "$GITHUB_WORKSPACE/reports/Magisk_v31.1_history.bundle"
-          git -C magisk bundle list-heads "$GITHUB_WORKSPACE/reports/Magisk_v31.1_history.bundle" > reports/bundle_heads.txt
-          grep -q 0972f67d97f9b6302b67c5171283330c74114b4a reports/bundle_heads.txt
-          test -s reports/Magisk_v31.1_history.bundle
-          sha256sum reports/Magisk_v31.1_history.bundle > reports/SHA256SUMS.txt
+          test "$(git -C magisk rev-parse HEAD)" = '0972f67d97f9b6302b67c5171283330c74114b4a'
+          cat > reports/native-manager-r3.patch <<'R3_NATIVE_PATCH'
+          diff --git a/native/src/core/db.rs b/native/src/core/db.rs
+          index a2b94dbd5..495303c7d 100644
+          --- a/native/src/core/db.rs
+          +++ b/native/src/core/db.rs
+          @@ -258,6 +258,27 @@ impl MagiskD {
+                   val
+               }
+           
+          +    /// Read the optional legacy `requester` name as TEXT from v31.1's existing
+          +    /// `settings` table. SQLite's INTEGER affinity supports text rows, so this
+          +    /// does not downgrade the database or reintroduce the removed `strings` table.
+          +    /// Treat the value as *untrusted* until package.rs validates its APKs.
+          +    pub fn get_repackaged_manager_pkg(&self) -> String {
+          +        let mut value = String::new();
+          +        let mut on_row = |_: &[String], row: &DbValues| {
+          +            value.clear();
+          +            value.push_str(row.get_text(0));
+          +        };
+          +        self.db_exec_with_rows(
+          +            "SELECT COALESCE(CAST(value AS TEXT), '') FROM settings WHERE key='requester' LIMIT 1",
+          +            &[],
+          +            &mut on_row,
+          +        )
+          +        .sql_result()
+          +        .log()
+          +        .ok();
+          +        value
+          +    }
+          +
+               pub fn get_db_settings(&self) -> SqliteResult<DbSettings> {
+                   let mut cfg = DbSettings {
+                       zygisk: self.is_emulator,
+          diff --git a/native/src/core/package.rs b/native/src/core/package.rs
+          index 94fea3ae4..a05cd45d7 100644
+          --- a/native/src/core/package.rs
+          +++ b/native/src/core/package.rs
+          @@ -3,16 +3,16 @@ use crate::daemon::{AID_APP_END, AID_APP_START, MagiskD, to_app_id};
+           #[cfg(all(feature = "check-signature", not(debug_assertions)))]
+           use crate::ffi::uninstall_pkg;
+           use base::WalkResult::{Abort, Continue, Skip};
+          -use base::const_format::concatcp;
+           use base::{
+               BufReadExt, Directory, FsPathBuilder, LoggedResult, ReadExt, ResultExt, Utf8CStrBuf,
+          -    Utf8CString, cstr, error, pre_order_walk,
+          +    Utf8CString, cstr, error, fd_get_attr, pre_order_walk,
+           };
+           use bit_set::BitSet;
+           use nix::fcntl::OFlag;
+           use std::fs::File;
+           use std::io;
+           use std::io::{Cursor, Read, Seek, SeekFrom};
+          +use std::os::fd::AsRawFd;
+           use std::time::Duration;
+           
+           const EOCD_MAGIC: u32 = 0x06054B50;
+          @@ -48,7 +48,7 @@ macro_rules! bad_apk {
+            * This method extracts the first certificate of the first signer
+            * within the APK v2 signature block.
+            */
+          -fn read_certificate(apk: &mut File) -> Vec<u8> {
+          +fn read_certificate(apk: &mut File, min_version_code: i32) -> Vec<u8> {
+               let res = || -> io::Result<Vec<u8>> {
+                   let mut u32_val = 0u32;
+                   let mut u64_val = 0u64;
+          @@ -93,7 +93,7 @@ fn read_certificate(apk: &mut File) -> Vec<u8> {
+                           true
+                       }
+                   });
+          -        if MAGISK_VER_CODE > apk_ver {
+          +        if min_version_code > apk_ver {
+                       Err(bad_apk!("APK version too low"))?;
+                   }
+           
+          @@ -147,14 +147,14 @@ fn read_certificate(apk: &mut File) -> Vec<u8> {
+               res.log().unwrap_or(vec![])
+           }
+           
+          -fn find_apk_path() -> Option<Utf8CString> {
+          +fn find_apk_path(pkg: &str) -> Option<Utf8CString> {
+               let mut buf = Utf8CString::default();
+               pre_order_walk(cstr!("/data/app"), |e, path| {
+                   if !e.is_dir() {
+                       return Ok(Skip);
+                   }
+                   let name = e.name();
+          -        if name.starts_with(concatcp!(APP_PACKAGE_NAME, "-")) {
+          +        if name.starts_with(pkg) && name.as_bytes().get(pkg.len()) == Some(&b'-') {
+                       // Found the APK path, we can abort now
+                       buf.append_path(path).append_path("base.apk");
+                       return Ok(Abort);
+          @@ -208,12 +208,12 @@ impl TrackedFile {
+           }
+           
+           fn check_apk(tracked: &mut TrackedFile) -> bool {
+          -    let Some(apk) = find_apk_path() else {
+          +    let Some(apk) = find_apk_path(APP_PACKAGE_NAME) else {
+                   return false;
+               };
+           
+               let cert = match apk.open(OFlag::O_RDONLY | OFlag::O_CLOEXEC) {
+          -        Ok(mut fd) => read_certificate(&mut fd),
+          +        Ok(mut fd) => read_certificate(&mut fd, MAGISK_VER_CODE),
+                   Err(_) => return false,
+               };
+           
+          @@ -230,8 +230,67 @@ fn check_apk(tracked: &mut TrackedFile) -> bool {
+               true
+           }
+           
+          +// Research-stage native integration only. The repackaged package is NOT authorized
+          +// merely because a database row exists: it must have an installed stub and an
+          +// original-signature-verified dynamic Magisk APK owned by the same Android app.
+          +// Do not accept a repackaged manager in builds without a pinned signing cert.
+          +fn valid_repackaged_pkg(pkg: &str) -> bool {
+          +    if pkg == APP_PACKAGE_NAME || pkg.len() > 200 || pkg.len() < 3 || !pkg.contains('.') {
+          +        return false;
+          +    }
+          +    pkg.split('.').all(|segment| {
+          +        let mut chars = segment.bytes();
+          +        matches!(chars.next(), Some(b'a'..=b'z'))
+          +            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+          +    })
+          +}
+          +
+          +fn check_repackaged_manager(user: i32, pkg: &str) -> Option<i32> {
+          +    // The original APK must be signed with the certificate embedded at build.
+          +    // An unsigned/unpinned research build must never silently grant manager UID.
+          +    if !valid_repackaged_pkg(pkg) || TRUSTED_CERT.is_empty() {
+          +        return None;
+          +    }
+          +
+          +    // Verify this package really has an installed repackaged stub APK.
+          +    let stub = find_apk_path(pkg)?;
+          +    let mut stub_fd = stub.open(OFlag::O_RDONLY | OFlag::O_CLOEXEC).ok()?;
+          +    if read_certificate(&mut stub_fd, -1).is_empty() {
+          +        return None;
+          +    }
+          +
+          +    // The real manager code in the stub's private storage must be Magisk-signed.
+          +    // Do not trust arbitrary data from the requester settings row.
+          +    let uid = get_package_uid(user, pkg);
+          +    if !(AID_APP_START..=AID_APP_END).contains(&to_app_id(uid)) {
+          +        return None;
+          +    }
+          +    let dyn_path = cstr::buf::default()
+          +        .join_path(APP_DATA_DIR)
+          +        .join_path_fmt(user)
+          +        .join_path(pkg)
+          +        .join_path("dyn")
+          +        .join_path("current.apk");
+          +    let mut dyn_fd = dyn_path.open(OFlag::O_RDONLY | OFlag::O_CLOEXEC).ok()?;
+          +    let dyn_owner = fd_get_attr(dyn_fd.as_raw_fd()).ok()?.st.st_uid as i32;
+          +    if dyn_owner != uid {
+          +        return None;
+          +    }
+          +    let cert = read_certificate(&mut dyn_fd, MAGISK_VER_CODE);
+          +    if cert.as_slice() != TRUSTED_CERT {
+          +        error!("pkg: dynamic manager signature mismatch: {}", dyn_path);
+          +        return None;
+          +    }
+          +    Some(uid)
+          +}
+          +
+           impl MagiskD {
+               pub fn get_manager_uid(&self, user: i32) -> i32 {
+          +        // Preserve v31.1's original manager lookup as the fallback.
+          +        let pkg = self.get_repackaged_manager_pkg();
+          +        if let Some(uid) = check_repackaged_manager(user, &pkg) {
+          +            return uid;
+          +        }
+                   let mut tracked = self.manager_info.lock();
+                   if tracked.is_same() {
+                       return if &tracked.path == PACKAGES_XML {
+          R3_NATIVE_PATCH
+          printf '%s  reports/native-manager-r3.patch\n' '537ec36cde696b1a9f6a379493b704b2cbd8a1e5a87cbe4ca5e036955ac60dd7' | sha256sum -c -
+          git -C magisk apply --check ../reports/native-manager-r3.patch
+          git -C magisk apply ../reports/native-manager-r3.patch
+          git -C magisk diff --check
+          git -C magisk diff --stat | tee reports/change_summary.txt
+          git -C magisk diff --binary > reports/applied_source.diff
 
-      - name: Check all eight removal commits separately and collect paths
+      - name: Verify database compatibility without changing schema
         shell: bash
         run: |
           set -euo pipefail
-          base=0972f67d97f9b6302b67c5171283330c74114b4a
-          printf 'REMOVAL_COMMIT\tRESULT\tUNMERGED_FILES\n' > reports/independent_reverts.tsv
-          errors=0
-          for sha in \
-            e31ef291d401faa21c20fb791c38f1e60bedfa2e \
-            d22fea290654dcf7bad9128f79834535ee3f47c3 \
-            c86a8776cee88689dd684ec1dd7d584d77540110 \
-            447a8f9965198f32a125b6c2c33644ca9604976e \
-            5f2faee61879859004acb34811051f45d51a5191 \
-            7d9b0dfb3e58ab0959021533e0d19ba362b766a7 \
-            1240c2e35ca3f232d7a125238a33e634e9ab3231 \
-            58477458401a298c02604b99caf5afcdb9ed9e3f; do
-            work="$RUNNER_TEMP/hide-review-$sha"
-            git -C magisk worktree add --detach "$work" "$base" > /dev/null
-            if git -C "$work" revert --no-commit "$sha" > reports/last_revert.log 2>&1; then
-              result=APPLIES_IN_ISOLATION
-            else
-              result=GIT_REVERT_FAILED
-            fi
-            files="$(git -C "$work" diff --name-only --diff-filter=U | paste -sd ',' -)"
-            if [ "$result" = GIT_REVERT_FAILED ]; then
-              if [ -n "$files" ]; then
-                result=MERGE_CONFLICT
-              else
-                result=UNEXPECTED_GIT_ERROR
-                cat reports/last_revert.log >> reports/unexpected_git_errors.log
-                errors=$((errors + 1))
-              fi
-            fi
-            printf '%s\t%s\t%s\n' "$sha" "$result" "$files" >> reports/independent_reverts.tsv
-            git -C magisk worktree remove --force "$work"
-          done
-          test "$(($(wc -l < reports/independent_reverts.tsv) - 1))" -eq 8
-          cat reports/independent_reverts.tsv
-          rm -f reports/last_revert.log
-          test "$errors" -eq 0
+          python3 - <<'PY_VALIDATE_R3'
+          import sqlite3
+          from pathlib import Path
+          p=Path('magisk/native/src/core/package.rs').read_text()
+          d=Path('magisk/native/src/core/db.rs').read_text()
+          assert 'check_repackaged_manager' in p
+          assert 'TRUSTED_CERT.is_empty()' in p
+          assert 'fd_get_attr(dyn_fd.as_raw_fd())' in p
+          assert 'get_repackaged_manager_pkg()' in p
+          assert "SELECT COALESCE(CAST(value AS TEXT), '') FROM settings WHERE key='requester' LIMIT 1" in d
+          con=sqlite3.connect(':memory:')
+          con.execute('CREATE TABLE settings (key TEXT, value INT, PRIMARY KEY(key))')
+          con.execute("INSERT INTO settings VALUES ('multiuser_mode',2)")
+          con.execute("INSERT INTO settings VALUES ('requester','sample.manager')")
+          assert con.execute("SELECT value FROM settings WHERE key='requester'").fetchone()[0]=='sample.manager'
+          assert con.execute("SELECT value FROM settings WHERE key='multiuser_mode'").fetchone()[0]==2
+          print('Native source prerequisites and v13 settings compatibility: PASS')
+          PY_VALIDATE_R3
 
-      - name: Mark source artifact as research only
-        if: always()
+      - name: Set up Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Obtain pinned official Magisk ONDK
         shell: bash
         run: |
-          mkdir -p reports
-          cat > reports/READ_ME_FIRST.txt <<'EOF'
-          OFFICIAL MAGISK v31.1 SOURCE + GIT HISTORY (open-source reference).
-          The eight checks are INDEPENDENT and do not prove a complete port.
-          This is NOT Magisk Alpha 31100, NOT a flashable module or APK.
-          No installation, boot modification, or device testing occurred.
-          EOF
+          set -euo pipefail
+          (cd magisk && python3 build.py -v ndk) 2>&1 | tee reports/ondk.log
 
-      - name: Upload source and conflict inventory
+      - name: Compile Magisk native ARM64 and ARM32 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'abiList=arm64-v8a,armeabi-v7a\n' > r3-abis.prop
+          (cd magisk && python3 build.py -vr -c ../r3-abis.prop native magisk) 2>&1 | tee reports/native_build.log
+          echo 'Native source compilation succeeded (not a full Magisk build).' | tee reports/BUILD_STATUS.txt
+
+      - name: Upload patch, exact source diff and compiler diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: MAGISK_31_1_SOURCE_FOR_OFFLINE_BACKPORT
+          name: R3_NATIVE_COMPILER_EVIDENCE_NOT_FLASHABLE
           path: reports/
-          if-no-files-found: error
-          retention-days: 7
+          if-no-files-found: warn
+          retention-days: 14

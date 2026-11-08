@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R6.1 - Restore Core Shared Module Link
+name: Magisk Manager-Hide R6.2 - Preserve Modern Android Manifest
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # No manager migration UI yet. No device install. Stub build must be actually verified.
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Build Magisk 31.1 R6.1 with core shared dependency restored
+    name: Build Magisk 31.1 R6.2 with manifest alignment
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     steps:
@@ -877,6 +877,51 @@ jobs:
           assert text.count('api(project(":shared"))') == 1
           print('R6.1 original Magisk :core -> :shared API link restored: PASS')
           PY_R61_SHARED_LINK
+          # R6.2: the historical shared library manifest forces Android's back
+          # dispatcher callback to false, but pinned 31.1 core requires true.
+          # A shared library must not override the app's modern back handling.
+          # Keep the official v31.1 core setting intact; remove only the obsolete
+          # library override. Assert there are no other conflicting app attributes.
+          python3 - <<'PY_R62_MANIFEST'
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          root=Path('magisk/app')
+          manifests={name: root/name/'src/main/AndroidManifest.xml'
+                     for name in ('core', 'shared', 'apk', 'stub')}
+          for path in manifests.values():
+              assert path.is_file(), f'Missing pinned module manifest: {path}'
+          android='{http://schemas.android.com/apk/res/android}'
+          key=android+'enableOnBackInvokedCallback'
+          def attrs(name):
+              el=ET.parse(manifests[name]).getroot().find('application')
+              assert el is not None, f'No application element in {name}'
+              return el.attrib
+          before_core=attrs('core')
+          before_shared=attrs('shared')
+          apk=attrs('apk')
+          assert before_core.get(key)=='true', 'Official 31.1 back callback setting changed'
+          assert before_shared.get(key)=='false', 'Historical shared manifest baseline changed'
+          assert key not in apk, 'APK manifest now owns the callback setting'
+          collisions={k:(before_core[k],before_shared[k])
+                      for k in set(before_core)&set(before_shared)
+                      if before_core[k]!=before_shared[k]}
+          assert collisions=={key:('true','false')}, f'Other manifest collisions: {collisions}'
+          path=manifests['shared']
+          content=path.read_text(encoding='utf-8')
+          obsolete='        android:enableOnBackInvokedCallback="false"\n'
+          assert content.count(obsolete)==1, 'Unexpected historical back callback layout'
+          path.write_text(content.replace(obsolete,'',1),encoding='utf-8')
+          assert key not in attrs('shared'), 'Obsolete override was not removed'
+          assert attrs('core').get(key)=='true', 'Official Magisk v31.1 core was altered'
+          # Check ALL shared application attributes, not only the known conflict.
+          core,shared=attrs('core'),attrs('shared')
+          remaining={k:(core[k],shared[k]) for k in set(core)&set(shared)
+                     if core[k]!=shared[k]}
+          assert not remaining, f'Inconsistent app manifest attributes remain: {remaining}'
+          assert attrs('stub') is not None
+          print('R6.2 31.1/shared/stub APK manifest compatibility: PASS')
+          PY_R62_MANIFEST
+          cp magisk/app/shared/src/main/AndroidManifest.xml reports/R6_2_reviewed_shared_AndroidManifest.xml
           git -C magisk diff --check
           git -C magisk diff --binary > reports/R6_tracked_source.diff
           git -C magisk diff --stat > reports/R6_tracked_stats.txt
@@ -924,6 +969,15 @@ jobs:
           assert 'get_repackaged_manager_pkg' in read('native/src/core/db.rs')
           assert (m/'app/stub/src/main/java/com/topjohnwu/magisk/DynLoad.java').is_file()
           assert 'api(project(":shared"))' in read('app/core/build.gradle.kts'), 'R6.1 shared-API dependency missing'
+          # Recheck manifest overlay compatibility in a separate workflow step.
+          an='{http://schemas.android.com/apk/res/android}'
+          core=ET.parse(m/'app/core/src/main/AndroidManifest.xml').getroot().find('application').attrib
+          shared=ET.parse(m/'app/shared/src/main/AndroidManifest.xml').getroot().find('application').attrib
+          app=ET.parse(m/'app/apk/src/main/AndroidManifest.xml').getroot().find('application').attrib
+          assert core.get(an+'enableOnBackInvokedCallback')=='true'
+          assert an+'enableOnBackInvokedCallback' not in shared
+          assert an+'enableOnBackInvokedCallback' not in app
+          assert not {k:(core[k],shared[k]) for k in set(core)&set(shared) if core[k]!=shared[k]}
           assert 'from(stubTask)' in read('app/build-logic/src/main/java/Setup.kt')
           root=ET.parse(m/'app/core/src/main/res/values/strings.xml').getroot()
           names={e.get('name') for e in root if e.tag=='string'}
@@ -1007,7 +1061,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: R6_1_COMPILER_EVIDENCE_DO_NOT_FLASH
+          name: R6_2_COMPILER_EVIDENCE_DO_NOT_FLASH
           path: reports/
           if-no-files-found: error
           retention-days: 14

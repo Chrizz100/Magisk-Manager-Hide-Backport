@@ -1,188 +1,120 @@
-name: Magisk Manager-Hide R2.2 - Native Stub Conflict Review
+name: Magisk Manager-Hide - Clean Source Recovery
 
+# Read-only source recovery: never installs, flashes, or claims a working backport.
+# This workflow deliberately does not use the old main.zip or hidden YAML archives.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'main.zip'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: magisk-manager-hide-r2-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  source-audit:
-    name: R2 - Verify original revisions and test reconstruction logic
+  recover-source:
+    name: Fetch authentic 31.1 history and check all 8 removals
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - name: Checkout repository with main.zip
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Validate and extract main.zip
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f main.zip
-          unzip -t main.zip > /dev/null
-          mkdir -p kit
-          unzip -q main.zip -d kit
-          cmp .github/workflows/build.yml kit/.github/workflows/build.yml
-          (cd kit && sha256sum -c MANIFEST.sha256)
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Install pinned YAML validator
-        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
-
-      - name: Validate R2 workflow and safety gates
-        run: python3 kit/tools/validate_workflow.py .github/workflows/build.yml
-
-      - name: Run all R2 tests
-        run: python3 -m unittest discover -s kit/tests -v
-
-      - name: Checkout exact historical source before removal
-        uses: actions/checkout@v4
-        with:
-          repository: topjohnwu/Magisk
-          ref: ea16c8141eb64dc28b56a0e7fb536689ef465429
-          path: pre-removal
-          persist-credentials: false
-
-      - name: Checkout official Magisk 31.1
-        uses: actions/checkout@v4
+      - name: Get exact Magisk 31.1 with complete Git history
+        uses: actions/checkout@v6
         with:
           repository: topjohnwu/Magisk
           ref: 0972f67d97f9b6302b67c5171283330c74114b4a
-          path: official-31-1
-          persist-credentials: false
-
-      - name: Run pinned upstream component audit
-        run: |
-          python3 kit/tools/audit.py \
-            --pre pre-removal \
-            --final official-31-1 \
-            --output reports/R2_upstream_audit.json
-
-      - name: Upload source audit report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: R2_PINNED_SOURCE_AUDIT
-          path: reports/
-          if-no-files-found: warn
-          retention-days: 14
-
-  reconstruct-and-build:
-    name: R2.2 - Reconstruct 31.1 manager-hide and build only if clean
-    needs: source-audit
-    runs-on: ubuntu-24.04
-    timeout-minutes: 95
-    steps:
-      - name: Checkout repository with main.zip
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Validate and extract main.zip
-        shell: bash
-        run: |
-          set -euo pipefail
-          unzip -t main.zip > /dev/null
-          mkdir -p kit
-          unzip -q main.zip -d kit
-          cmp .github/workflows/build.yml kit/.github/workflows/build.yml
-          (cd kit && sha256sum -c MANIFEST.sha256)
-
-      - name: Checkout official Magisk 31.1 with complete history and submodules
-        uses: actions/checkout@v4
-        with:
-          repository: topjohnwu/Magisk
-          ref: 0972f67d97f9b6302b67c5171283330c74114b4a
-          fetch-depth: 0
-          submodules: recursive
           path: magisk
+          fetch-depth: 0
+          submodules: false
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Revert all 8 removal commits with pinned manifest and native conflict reconciliation
-        run: python3 kit/tools/reconstruct.py --repo magisk --reports reports
-
-      - name: Set up Java 25 for Magisk build
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '25'
-
-      - name: Verify original Android 13 and ARM targets
+      - name: Validate pinned upstream source
         shell: bash
         run: |
           set -euo pipefail
-          grep -qx 'abiList=arm64-v8a,armeabi-v7a' kit/config/sweet.prop
-          grep -qx 'magisk.versionCode=31100' magisk/app/gradle.properties
-          test -n "${ANDROID_HOME:-}"
-          javac -version
+          cd magisk
+          base=0972f67d97f9b6302b67c5171283330c74114b4a
+          test "$(git rev-parse HEAD)" = "$base"
+          git merge-base --is-ancestor ea16c8141eb64dc28b56a0e7fb536689ef465429 HEAD
+          for sha in \
+            e31ef291d401faa21c20fb791c38f1e60bedfa2e \
+            d22fea290654dcf7bad9128f79834535ee3f47c3 \
+            c86a8776cee88689dd684ec1dd7d584d77540110 \
+            447a8f9965198f32a125b6c2c33644ca9604976e \
+            5f2faee61879859004acb34811051f45d51a5191 \
+            7d9b0dfb3e58ab0959021533e0d19ba362b766a7 \
+            1240c2e35ca3f232d7a125238a33e634e9ab3231 \
+            58477458401a298c02604b99caf5afcdb9ed9e3f; do
+            test "$(git cat-file -t "$sha")" = commit
+            git merge-base --is-ancestor "$sha" "$base"
+          done
 
-      - name: Acquire official Magisk ONDK
-        shell: bash
-        run: cd magisk && python3 build.py -v ndk
-
-      - name: Compile source candidate for ARM64 and ARM32
+      - name: Package complete Git history for offline repair
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p reports
-          (cd magisk && python3 build.py -vr -c ../kit/config/sweet.prop all) \
-            2>&1 | tee reports/R2_build.log
+          git -C magisk bundle create "$GITHUB_WORKSPACE/reports/Magisk_v31.1_history.bundle" HEAD
+          git -C magisk bundle verify "$GITHUB_WORKSPACE/reports/Magisk_v31.1_history.bundle"
+          git -C magisk bundle list-heads "$GITHUB_WORKSPACE/reports/Magisk_v31.1_history.bundle" > reports/bundle_heads.txt
+          grep -q 0972f67d97f9b6302b67c5171283330c74114b4a reports/bundle_heads.txt
+          test -s reports/Magisk_v31.1_history.bundle
+          sha256sum reports/Magisk_v31.1_history.bundle > reports/SHA256SUMS.txt
 
-      - name: Verify unsigned source claims and APK archive structure
-        run: |
-          python3 kit/tools/verify_build.py \
-            --apk magisk/out/app-release.apk \
-            --output reports/R2_apk_check.json
-          python3 kit/tools/verify_candidate.py \
-            --apk magisk/out/app-release.apk \
-            --output reports/R2_candidate_check.json
-
-      - name: Mark candidate as untested, not for installation
+      - name: Check all eight removal commits separately and collect paths
         shell: bash
         run: |
-          cat > magisk/out/DO_NOT_INSTALL_OR_FLASH.txt <<'EOF'
-          UNTESTED MANAGER-HIDE R2 RESEARCH CANDIDATE
-          Not Magisk Alpha 31100; fork of official Magisk 31.1.
-          This is NOT a normal Magisk module or a verified bank/root-hiding fix.
-          Native manager migration, APK signing and Android 13 emulator tests
-          are REQUIRED before any installation on a physical device.
-          Do not flash boot images. Do not install these APKs on your phone.
+          set -euo pipefail
+          base=0972f67d97f9b6302b67c5171283330c74114b4a
+          printf 'REMOVAL_COMMIT\tRESULT\tUNMERGED_FILES\n' > reports/independent_reverts.tsv
+          errors=0
+          for sha in \
+            e31ef291d401faa21c20fb791c38f1e60bedfa2e \
+            d22fea290654dcf7bad9128f79834535ee3f47c3 \
+            c86a8776cee88689dd684ec1dd7d584d77540110 \
+            447a8f9965198f32a125b6c2c33644ca9604976e \
+            5f2faee61879859004acb34811051f45d51a5191 \
+            7d9b0dfb3e58ab0959021533e0d19ba362b766a7 \
+            1240c2e35ca3f232d7a125238a33e634e9ab3231 \
+            58477458401a298c02604b99caf5afcdb9ed9e3f; do
+            work="$RUNNER_TEMP/hide-review-$sha"
+            git -C magisk worktree add --detach "$work" "$base" > /dev/null
+            if git -C "$work" revert --no-commit "$sha" > reports/last_revert.log 2>&1; then
+              result=APPLIES_IN_ISOLATION
+            else
+              result=GIT_REVERT_FAILED
+            fi
+            files="$(git -C "$work" diff --name-only --diff-filter=U | paste -sd ',' -)"
+            if [ "$result" = GIT_REVERT_FAILED ]; then
+              if [ -n "$files" ]; then
+                result=MERGE_CONFLICT
+              else
+                result=UNEXPECTED_GIT_ERROR
+                cat reports/last_revert.log >> reports/unexpected_git_errors.log
+                errors=$((errors + 1))
+              fi
+            fi
+            printf '%s\t%s\t%s\n' "$sha" "$result" "$files" >> reports/independent_reverts.tsv
+            git -C magisk worktree remove --force "$work"
+          done
+          test "$(($(wc -l < reports/independent_reverts.tsv) - 1))" -eq 8
+          cat reports/independent_reverts.tsv
+          rm -f reports/last_revert.log
+          test "$errors" -eq 0
+
+      - name: Mark source artifact as research only
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p reports
+          cat > reports/READ_ME_FIRST.txt <<'EOF'
+          OFFICIAL MAGISK v31.1 SOURCE + GIT HISTORY (open-source reference).
+          The eight checks are INDEPENDENT and do not prove a complete port.
+          This is NOT Magisk Alpha 31100, NOT a flashable module or APK.
+          No installation, boot modification, or device testing occurred.
           EOF
 
-      - name: Upload UNTESTED compiled candidate
-        if: success()
-        uses: actions/upload-artifact@v4
+      - name: Upload source and conflict inventory
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: R2_EXPERIMENTAL_MAGISK_CANDIDATE_DO_NOT_FLASH
-          path: magisk/out/
+          name: MAGISK_31_1_SOURCE_FOR_OFFLINE_BACKPORT
+          path: reports/
           if-no-files-found: error
           retention-days: 7
-
-      - name: Upload reconstruction evidence and build diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: R2_2_RECONSTRUCTION_AND_BUILD_REPORT
-          path: reports/
-          if-no-files-found: warn
-          retention-days: 14

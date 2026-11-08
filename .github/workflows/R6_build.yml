@@ -1,8 +1,7 @@
-name: Magisk Manager-Hide R6.2 - Preserve Modern Android Manifest
+name: Magisk Manager-Hide R6.3 - Remove Unused Compose Coroutine Scope
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
-# No manager migration UI yet. No device install. Stub build must be actually verified.
-# Extends R4 and builds the old stub loader as an APK asset; UI still missing.
+# Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
 # No main.zip, no Base64 code archives, no installation or flashing.
 on:
   workflow_dispatch:
@@ -12,7 +11,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Build Magisk 31.1 R6.2 with manifest alignment
+    name: Build Magisk 31.1 R6.3 with corrected Compose UI
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     steps:
@@ -654,7 +653,7 @@ jobs:
               replace_once(home,'import androidx.compose.material3.MaterialTheme\n','import androidx.compose.material3.MaterialTheme\nimport androidx.compose.material3.OutlinedTextField\n')
               replace_once(home,'import com.topjohnwu.magisk.core.Info\n','import com.topjohnwu.magisk.core.Info\nimport com.topjohnwu.magisk.core.isRunningAsStub\n')
               replace_once(home,'import com.topjohnwu.magisk.core.model.UpdateInfo\n','import com.topjohnwu.magisk.core.model.UpdateInfo\nimport com.topjohnwu.magisk.core.tasks.AppMigration\n')
-              replace_once(home,'    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()\n','    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()\n    val migrationScope = rememberCoroutineScope()\n    var migrationBusy by remember { mutableStateOf(false) }\n    var showHideDialog by rememberSaveable { mutableStateOf(false) }\n    var showRestoreDialog by rememberSaveable { mutableStateOf(false) }\n')
+              replace_once(home,'    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()\n','    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()\n    var showHideDialog by rememberSaveable { mutableStateOf(false) }\n    var showRestoreDialog by rememberSaveable { mutableStateOf(false) }\n')
               replace_once(home,'    LoadingDialog(visible = uiState.showLoading)\n','    LoadingDialog(visible = uiState.showLoading)\n')
               replace_once(home,'    val scrollState = rememberScrollState()\n', '''    if (showHideDialog) {
                   HideAppDialog(
@@ -853,7 +852,7 @@ jobs:
                   sys.exit('usage: apply_r6.py <Magisk 31.1 checkout after R5>')
               apply(sys.argv[1])
           R6_VERIFIED_SOURCE
-          printf '%s  r6_migration.py\n' 'a063bd2664f38d825325610ef48c075088e2b23cf33e4e5b2a469eae4c79314b' | sha256sum -c -
+          printf '%s  r6_migration.py\n' '489ece815abe1f779445feaa9f3e880965e77f294c6f917a8522501cd349c001' | sha256sum -c -
           python3 r6_migration.py magisk
           # R6.1: restore the exact original Magisk :core -> :shared Gradle API edge.
           # R5 already restored :shared; R6 introduced imports of StubApk in core,
@@ -962,6 +961,10 @@ jobs:
           assert 'suspend fun restoreApp' in migration
           assert 'fun hideManager(label: String)' in vm and 'fun restoreManager()' in vm
           assert 'viewModelScope.launch' in vm
+          # R6.3: the Compose screen must not own a coroutine that is unused.
+          # Work and progress remain in ViewModel; prevent stale missing imports.
+          assert 'rememberCoroutineScope()' not in ui, 'Stale Compose coroutine invocation'
+          assert 'migrationScope' not in ui and 'migrationBusy' not in ui, 'Unused UI coroutine state'
           assert 'HideAppDialog(' in ui and 'RestoreAppDialog(' in ui
           assert 'AppMigration.patchAndHide' not in ui
           assert 'Config.toBundle()' not in migration
@@ -1061,7 +1064,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: R6_2_COMPILER_EVIDENCE_DO_NOT_FLASH
+          name: R6_3_COMPILER_EVIDENCE_DO_NOT_FLASH
           path: reports/
           if-no-files-found: error
           retention-days: 14

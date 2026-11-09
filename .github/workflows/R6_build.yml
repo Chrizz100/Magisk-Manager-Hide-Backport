@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R9 - Official AVD Root and Manager Hide/Restore
+name: Magisk Manager-Hide R9.1 - Verified BusyBox/bootctl and Root Emulator
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Build pinned R6.4 then validate R8 GUI and R9 Magisk daemon hide/restore
+    name: Build pinned R6.4 with verified core assets, then R8 GUI and R9 root test
     runs-on: ubuntu-24.04
     timeout-minutes: 115
     steps:
@@ -1304,6 +1304,182 @@ jobs:
         with:
           path: ~/.cache/magisk-r81-verified-tools
           key: magisk-r81-ubuntu24-ondk-r30.1-a05e40a2-gradle9.7.1-acd53f1e-v1
+
+      - name: R9.1 - Restore cached SHA-verified BusyBox and bootctl archives
+        id: r91_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/magisk-r91-runtime-assets
+          key: magisk-r91-official-core-busybox-b4d0551f-bootctl-2cf515ae-v1
+
+      - name: R9.1 - Verify and pin official BusyBox and bootctl before Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > r91_prefetch_core_assets.py <<'R91_ASSET_SCRIPT'
+          #!/usr/bin/env python3
+          """R9.1: fail-closed prefetch of official Magisk 31.1 core JNI dependencies.
+          
+          Download only the specific BusyBox and bootctl archives referenced by pinned
+          Magisk 31.1 Setup.kt, verify size/SHA256/ZIP integrity, and copy each into the
+          project-local Gradle download cache BEFORE invoking Gradle. Does not modify
+          Magisk sources, signing, device, native libraries, or APKs.
+          """
+          from __future__ import annotations
+          
+          from dataclasses import dataclass
+          from pathlib import Path
+          from typing import Callable
+          import hashlib
+          import json
+          import os
+          import shutil
+          import time
+          import urllib.request
+          import zipfile
+          
+          RELEASE = "https://github.com/topjohnwu/magisk-files/releases/download/files/"
+          API_ASSETS = "https://api.github.com/repos/topjohnwu/magisk-files/releases/assets/"
+          
+          @dataclass(frozen=True)
+          class Asset:
+              name: str
+              size: int
+              sha256: str
+              asset_id: int
+              def sources(self):
+                  return (RELEASE + self.name, API_ASSETS + str(self.asset_id))
+          
+          # Checksums must match the ORIGINAL Magisk 31.1 Setup.kt (commit 0972f67d).
+          # Sizes and API asset IDs are from the official topjohnwu/magisk-files release.
+          ASSETS = (
+              Asset("busybox-1.36.1.1.zip", 4592672,
+                    "b4d0551feabaf314e53c79316c980e8f66432e9fb91a69dbbf10a93564b40951",
+                    197195919),
+              Asset("bootctl-android-14.0.0_r1.zip", 250025,
+                    "2cf515aeb17259e88393a1322671ebab1968925864bc04ae57dad54e53ccf15b",
+                    531630586),
+          )
+          
+          
+          def inspect_file(path: Path, asset: Asset) -> bool:
+              if not path.is_file() or path.stat().st_size != asset.size:
+                  return False
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              if h.hexdigest() != asset.sha256:
+                  return False
+              try:
+                  with zipfile.ZipFile(path) as zf:
+                      return zf.testzip() is None and len(zf.namelist()) > 0
+              except (OSError, zipfile.BadZipFile):
+                  return False
+          
+          
+          def fetch_asset(asset: Asset, cache: Path,
+                          opener: Callable = urllib.request.urlopen,
+                          sleeper: Callable = time.sleep,
+                          retries: int = 3) -> tuple[Path, str]:
+              cache.mkdir(parents=True, exist_ok=True)
+              final = cache / asset.name
+              if inspect_file(final, asset):
+                  return final, "validated-cache"
+              final.unlink(missing_ok=True)
+              errors: list[str] = []
+              for round_num in range(retries):
+                  for source in asset.sources():
+                      candidate = cache / (asset.name + ".partial")
+                      candidate.unlink(missing_ok=True)
+                      try:
+                          headers = {"User-Agent": "Magisk-R9.1-Pinned-CI/1", "Accept": "application/octet-stream"}
+                          request = urllib.request.Request(source, headers=headers)
+                          with opener(request, timeout=60) as response, candidate.open("wb") as out:
+                              while True:
+                                  block = response.read(1024 * 256)
+                                  if not block:
+                                      break
+                                  if out.tell() + len(block) > asset.size:
+                                      raise ValueError("response exceeds official asset size")
+                                  out.write(block)
+                          if not inspect_file(candidate, asset):
+                              raise ValueError("size, SHA-256 or ZIP integrity mismatch")
+                          candidate.replace(final)
+                          return final, source
+                      except Exception as exc:
+                          errors.append(f"round {round_num+1}, {source}: {type(exc).__name__}: {str(exc)[:180]}")
+                      finally:
+                          candidate.unlink(missing_ok=True)
+                  if round_num < retries - 1:
+                      sleeper(min(3 + 3 * round_num, 10))
+              raise RuntimeError(f"Unable to obtain official pinned {asset.name}. Fail closed.\n" + "\n".join(errors))
+          
+          
+          def validate_source(setup: Path) -> None:
+              if not setup.is_file():
+                  raise RuntimeError("Missing Magisk 31.1 app/build-logic/src/main/java/Setup.kt")
+              text = setup.read_text(encoding="utf-8")
+              for asset, symbol in zip(ASSETS, ("BUSYBOX", "BOOTCTL")):
+                  if (f'"{RELEASE}{asset.name}"' not in text or
+                      f'"{asset.sha256}"' not in text or
+                      f"{symbol}_ZIP_CHECKSUM" not in text):
+                      raise RuntimeError("Pinned source does not match original "+asset.name)
+              # Gradle's Project is :core when setupCoreLib() calls downloadFile().
+              for fragment in ("fun Project.setupCoreLib()", "layout.buildDirectory.file(checksum)",
+                               "from(zipTree(downloadFile(BUSYBOX_DOWNLOAD_URL, BUSYBOX_ZIP_CHECKSUM)))",
+                               "from(zipTree(downloadFile(BOOTCTL_DOWNLOAD_URL, BOOTCTL_ZIP_CHECKSUM)))"):
+                  if fragment not in text:
+                      raise RuntimeError("Magisk Gradle cache behavior changed: " + fragment)
+          
+          
+          def prepare(workspace: Path, cache: Path) -> dict:
+              repo = workspace / "magisk"
+              validate_source(repo / "app/build-logic/src/main/java/Setup.kt")
+              report = {"source_commit_expected": "0972f67d97f9b6302b67c5171283330c74114b4a", "assets": {}}
+              for asset in ASSETS:
+                  file, source = fetch_asset(asset, cache)
+                  # In Setup.kt, downloadFile() is a Project extension called from :core.
+                  # Thus layout.buildDirectory.file(checksum) resolves in app/core/build/.
+                  dest = repo / "app/core/build" / asset.sha256
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(file, dest)
+                  if not inspect_file(dest, asset):
+                      dest.unlink(missing_ok=True)
+                      raise RuntimeError("Failed to preseed Gradle core build cache with verified " + asset.name)
+                  report["assets"][asset.name] = {
+                      "sha256": asset.sha256, "size_bytes": asset.size,
+                      "location": str(dest.relative_to(workspace)), "source": source,
+                      "verified_sha256": True, "zip_ok": True,
+                  }
+              return report
+          
+          
+          def main() -> None:
+              workspace = Path(os.environ.get("GITHUB_WORKSPACE", os.getcwd()))
+              cache = Path.home() / ".cache" / "magisk-r91-runtime-assets"
+              report = prepare(workspace, cache)
+              out = workspace / "reports" / "r91_core_assets.json"
+              out.parent.mkdir(exist_ok=True, parents=True)
+              out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+              print("R9.1 verified original BusyBox and bootctl and preseeded Gradle cache: PASS")
+              for name, detail in report["assets"].items():
+                  print(name, detail["sha256"], detail["source"])
+          
+          if __name__ == "__main__":
+              main()
+          R91_ASSET_SCRIPT
+          python3 r91_prefetch_core_assets.py
+          test -s magisk/app/core/build/b4d0551feabaf314e53c79316c980e8f66432e9fb91a69dbbf10a93564b40951
+          test -s magisk/app/core/build/2cf515aeb17259e88393a1322671ebab1968925864bc04ae57dad54e53ccf15b
+          test -s reports/r91_core_assets.json
+
+      - name: R9.1 - Save verified official BusyBox/bootctl archive cache
+        if: steps.r91_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/magisk-r91-runtime-assets
+          key: magisk-r91-official-core-busybox-b4d0551f-bootctl-2cf515ae-v1
 
       - name: Generate throwaway R6 CI signing certificate (never distribute)
         shell: bash

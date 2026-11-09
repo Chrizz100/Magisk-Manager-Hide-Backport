@@ -3163,25 +3163,39 @@ jobs:
                     return xml if 'R11 E2E Testmodul' in xml else None
                 xml=self.wait(module_ui,'Magisk Modules UI fixture',seconds=80)
                 self.mark('R11_MODULE_UI_VISIBLE')
-                def toggle(xml):
+                def toggle(xml, expected_checked):
                     root=ET.fromstring(xml)
+                    matches=[]
                     for node in root.iter('node'):
-                        desc=node.get('content-desc','')
-                        if desc!='R11 E2E Testmodul': continue
-                        if node.get('checkable')!='true' and 'Switch' not in node.get('class',''): continue
-                        bounds=re.fullmatch(r'\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]',node.get('bounds',''))
-                        if not bounds: continue
-                        x0,y0,x1,y1=map(int,bounds.groups())
-                        self.adb(f'input tap {(x0+x1)//2} {(y0+y1)//2}')
-                        time.sleep(2)
-                        return
-                    raise RuntimeError('R11 ModuleScreen switch missing for test fixture')
-                toggle(xml)
+                        # Compose/Android UIAutomator puts the accessible label on a
+                        # nested child, while checked/clickable live on its parent.
+                        if node.get('checkable')!='true' or node.get('clickable')!='true':
+                            continue
+                        if not any(child.get('content-desc','')=='R11 E2E Testmodul'
+                                   for child in node.iter('node')):
+                            continue
+                        matches.append(node)
+                    if len(matches)!=1:
+                        raise RuntimeError('R11: expected exactly one target module switch, found '+str(len(matches)))
+                    node=matches[0]
+                    desired='true' if expected_checked else 'false'
+                    if node.get('checked')!=desired:
+                        raise RuntimeError('R11: wrong module switch state: expected '+desired+
+                                           ', got '+str(node.get('checked')))
+                    bounds=re.fullmatch(r'\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]',node.get('bounds',''))
+                    if not bounds:
+                        raise RuntimeError('R11: labeled module switch has no valid bounds')
+                    x0,y0,x1,y1=map(int,bounds.groups())
+                    if x1<=x0 or y1<=y0:
+                        raise RuntimeError('R11: invalid nonpositive switch area')
+                    self.adb(f'input tap {(x0+x1)//2} {(y0+y1)//2}')
+                    time.sleep(2)
+                toggle(xml, True)
                 self.wait(lambda:self.adb('test -f '+basedir+'/disable && echo YES || true')=='YES',
                           'module disabled marker from actual GUI',seconds=35)
                 self.mark('R11_MODULE_GUI_DISABLED')
                 xml=self.ui_dump('r11_module_disabled')
-                toggle(xml)
+                toggle(xml, False)
                 self.wait(lambda:self.adb('test ! -e '+basedir+'/disable && echo YES || true')=='YES',
                           'module enabled marker from actual GUI',seconds=35)
                 self.mark('R11_MODULE_GUI_ENABLED')

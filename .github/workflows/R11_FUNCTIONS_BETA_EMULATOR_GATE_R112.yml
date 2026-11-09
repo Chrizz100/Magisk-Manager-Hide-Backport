@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R11.3 - Fixed R11.2 Harness Integrity Pin and Strict Beta Gates
+name: Magisk Manager-Hide R11.4 - AVD App-owned Concealment and Restore Proof
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -1186,6 +1186,229 @@ jobs:
         git -C magisk diff --check
         git -C magisk diff -- app/core/src/main/java/com/topjohnwu/magisk/core/tasks/AppMigration.kt > reports/R97_RESTORE_CODE_CHANGE.diff
         test -s reports/R97_RESTORE_PATCH_STATUS.json
+
+    - name: R11.4 - AVD-only app-owned original concealment and verified restore source
+      shell: bash
+      run: |
+        set -euo pipefail
+        # APP-owned, explicitly confirmed hide/restore for disposable x86_64 AVD ONLY.
+        # Never enable this source path in an installable Alpha-device APK.
+        cat > r114_patch_concealment.py <<'PY_R114_SOURCE'
+        #!/usr/bin/env python3
+        """R11.4 experimental, emulator-only app-driven package concealment.
+        
+        Only modifies reconstructed official 31.1 Magisk's AppMigration, HomeScreen,
+        HomeViewModel after R9.7 patch; NEVER intended for a real-device release.
+        """
+        from pathlib import Path
+        import hashlib, json, sys
+        
+        MARKER='r114_original.sha256'
+        METHOD='''    /**
+             * Emulator research only: make the original manager invisible for user 0.
+             * This is deliberately a second, confirmed action from the LIVE hidden app.
+             * It is not a general-purpose phone or Magisk Alpha operation.
+             */
+            suspend fun finalizeConcealmentAvd(context: Context): Boolean {
+                if (!isRunningAsStub || !Info.isEmulator || Const.USER_ID != 0 ||
+                    context.packageName == APP_PACKAGE_NAME || !Info.env.isActive ||
+                    Config.suManager != context.packageName) return false
+                return withContext(Dispatchers.IO) {
+                    try {
+                        val original = File(context.packageManager.getApplicationInfo(APP_PACKAGE_NAME, 0).sourceDir)
+                        val retained = StubApk.current(context)
+                        if (!original.isFile || !retained.isFile || original.length() <= 0 ||
+                            original.length() != retained.length() ||
+                            !MessageDigest.isEqual(r114Digest(original), r114Digest(retained))) {
+                            android.util.Log.e("R114Conceal", "ORIGINAL_BACKUP_MISMATCH")
+                            return@withContext false
+                        }
+                        val saved = File(context.filesDir, "r114_original.sha256")
+                        val hex = r114Digest(retained).joinToString("") { "%02x".format(it.toInt() and 255) }
+                        saved.writeText(hex + "\\n")
+                        if (saved.readText().trim() != hex) return@withContext false
+                        // Probe that the running stub is actually installed and still the requester.
+                        if (Shell.cmd("pm path ${context.packageName}").await().out.none { it.startsWith("package:") }) {
+                            return@withContext false
+                        }
+                        // Preserve original application data when the package is removed for user 0.
+                        val result = Shell.cmd("pm uninstall -k --user 0 $APP_PACKAGE_NAME").await()
+                        if (!result.isSuccess || result.out.none { it.trim() == "Success" }) {
+                            android.util.Log.e("R114Conceal", "UNINSTALL_NOT_CONFIRMED")
+                            return@withContext false
+                        }
+                        val stillVisible = Shell.cmd("pm path $APP_PACKAGE_NAME").await().out.any { it.startsWith("package:") }
+                        val active = Shell.cmd("pm path ${context.packageName}").await().out.any { it.startsWith("package:") }
+                        if (stillVisible || !active) {
+                            android.util.Log.e("R114Conceal", "POST_UNINSTALL_PACKAGE_CHECK_FAILED")
+                            return@withContext false
+                        }
+                        android.util.Log.i("R114Conceal", "ORIGINAL_UNINSTALLED_USER0_VERIFIED")
+                        true
+                    } catch (e: Exception) {
+                        android.util.Log.e("R114Conceal", "TRANSACTION_ERROR", e)
+                        false
+                    }
+                }
+            }
+        
+            private fun r114Digest(file: File): ByteArray {
+                val digest = MessageDigest.getInstance("SHA-256")
+                file.inputStream().buffered().use { stream ->
+                    val bytes = ByteArray(65536)
+                    while (true) {
+                        val count = stream.read(bytes)
+                        if (count < 0) break
+                        if (count > 0) digest.update(bytes, 0, count)
+                    }
+                }
+                return digest.digest()
+            }
+        
+        '''
+        
+        RESTORE='''    suspend fun restoreApp(context: Context): Boolean {
+                // R11.4: AVD-only recovery from a deliberately uninstalled original.
+                // Keep R9.7's in-place hash comparison for the ordinary still-installed case.
+                if (!isRunningAsStub || context.packageName == APP_PACKAGE_NAME || !Info.env.isActive) {
+                    android.util.Log.e("R97Restore", "PRECONDITION_FAILED")
+                    return false
+                }
+                val switched = withContext(Dispatchers.IO) {
+                    try {
+                        val preserved = StubApk.current(context)
+                        if (!preserved.isFile || preserved.length() <= 0) return@withContext false
+                        var existing = try {
+                            File(context.packageManager.getApplicationInfo(APP_PACKAGE_NAME, 0).sourceDir)
+                        } catch (_: PackageManager.NameNotFoundException) {
+                            null
+                        }
+                        if (existing == null) {
+                            if (!Info.isEmulator || Const.USER_ID != 0 || Config.suManager != context.packageName) {
+                                android.util.Log.e("R97Restore", "AVD_ONLY_REINSTALL_GUARD_REJECTED")
+                                return@withContext false
+                            }
+                            val saved = File(context.filesDir, "r114_original.sha256")
+                            val hex = r114Digest(preserved).joinToString("") { "%02x".format(it.toInt() and 255) }
+                            if (!saved.isFile || saved.readText().trim() != hex) {
+                                android.util.Log.e("R97Restore", "BACKUP_SHA256_PIN_MISMATCH")
+                                return@withContext false
+                            }
+                            // Try reinstalling for user 0 without changing the application data.
+                            val previous = Shell.cmd("cmd package install-existing --user 0 $APP_PACKAGE_NAME").await()
+                            existing = try {
+                                File(context.packageManager.getApplicationInfo(APP_PACKAGE_NAME, 0).sourceDir)
+                            } catch (_: PackageManager.NameNotFoundException) {
+                                null
+                            }
+                            if (existing == null) {
+                                // The system may discard a sole-user APK; restore from the exact
+                                // retained, hash-checked original held by the dynamic stub.
+                                val installed = Shell.cmd("adb_pm_install $preserved $APP_PACKAGE_NAME").await()
+                                if (!installed.isSuccess) {
+                                    android.util.Log.e("R97Restore", "AVD_REINSTALL_FAILED")
+                                    return@withContext false
+                                }
+                                existing = try {
+                                    File(context.packageManager.getApplicationInfo(APP_PACKAGE_NAME, 0).sourceDir)
+                                } catch (_: PackageManager.NameNotFoundException) {
+                                    null
+                                }
+                            }
+                        }
+                        val source = existing ?: return@withContext false
+                        if (!source.isFile || preserved.length() != source.length() ||
+                            !MessageDigest.isEqual(r114Digest(preserved), r114Digest(source))) {
+                            android.util.Log.e("R97Restore", "ORIGINAL_APK_SHA256_MISMATCH")
+                            return@withContext false
+                        }
+                        android.util.Log.i("R97Restore", "ORIGINAL_APK_SHA256_VERIFIED")
+                        // Changes requester only AFTER the original package is restored and verified.
+                        Config.suManager = ""
+                        android.util.Log.i("R97Restore", "REQUESTER_CLEAR_SETTER_COMPLETED")
+                        true
+                    } catch (e: Exception) {
+                        android.util.Log.e("R97Restore", "RESTORE_TRANSACTION_EXCEPTION", e)
+                        false
+                    }
+                }
+                if (!switched) return false
+                val launched = launchApp(context, APP_PACKAGE_NAME)
+                android.util.Log.i("R97Restore", if (launched) "ORIGINAL_LAUNCH_SUBMITTED" else "ORIGINAL_LAUNCH_FAILED")
+                return launched
+            }
+        
+        '''
+        
+        VIEWMODEL='''    /** R11.4 AVD-only explicitly requested final package-concealment step. */
+            fun finalizeConcealmentAvd() {
+                if (_uiState.value.showLoading || !Info.isEmulator) return
+                viewModelScope.launch {
+                    val success = try {
+                        withLoading {
+                            val context = AppContext.foregroundActivity ?: AppContext
+                            AppMigration.finalizeConcealmentAvd(context)
+                        }
+                    } catch (e: Exception) { false }
+                    if (!success) showToast(CoreR.string.failure)
+                }
+            }
+        
+        '''
+        
+        UI='''                // Research-only two-phase app concealment: run only in the AVD.
+                        if (isRunningAsStub && Info.isEmulator) {
+                            Button(onClick = viewModel::finalizeConcealmentAvd) {
+                                Text("Complete Hide (AVD only)")
+                            }
+                        }
+        
+        '''
+        
+        
+        def patch(root):
+            root=Path(root)
+            src=root/'app/core/src/main/java/com/topjohnwu/magisk/core/tasks/AppMigration.kt'
+            ui=root/'app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeScreen.kt'
+            vm=root/'app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeViewModel.kt'
+            for p in (src,ui,vm):
+                if not p.is_file():raise RuntimeError('Missing pinned source: '+str(p))
+            before={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (src,ui,vm)}
+            code=src.read_text()
+            start='    suspend fun restoreApp(context: Context): Boolean {\n'
+            end='    suspend fun upgradeStub(context: Context, apk: File): Intent? {\n'
+            if code.count(start)!=1 or code.count(end)!=1:raise AssertionError('R9.7 restore boundaries changed')
+            a,b=code.index(start),code.index(end)
+            old=code[a:b]
+            for guard in ['MessageDigest.isEqual(sha256Of(preserved), sha256Of(installedOriginal))','ORIGINAL_APK_SHA256_VERIFIED','REQUESTER_CLEAR_SETTER_COMPLETED']:
+                if guard not in old:raise AssertionError('R9.7 original restore contract changed: '+guard)
+            if 'finalizeConcealmentAvd(' in code or 'r114Digest(' in code:raise AssertionError('Reapplication prohibited')
+            code=code[:a] + METHOD + RESTORE + code[b:]
+            src.write_text(code)
+            u=ui.read_text()
+            anchor='                StatusCard()\n'
+            if u.count(anchor)!=1:raise AssertionError('R11.4 HomeScreen insertion anchor moved')
+            if 'isRunningAsStub' not in u:raise AssertionError('Historical stub indicator missing')
+            ui.write_text(u.replace(anchor,anchor+'\n'+UI,1))
+            v=vm.read_text()
+            v_anchor='    fun restoreManager() {\n'
+            if v.count(v_anchor)!=1:raise AssertionError('R11.4 ViewModel method anchor moved')
+            if 'AppMigration' not in v or 'AppContext' not in v:raise AssertionError('R6 ViewModel root context imports changed')
+            vm.write_text(v.replace(v_anchor,VIEWMODEL+v_anchor,1))
+            after={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (src,ui,vm)}
+            policy={'revision':'R11.4','scope':'EXPERIMENTAL_ANDROID_13_AVD_ONLY','original_manager_package':'com.topjohnwu.magisk','original_uninstall_requires_explicit_ui_tap':True,'original_apk_sha256_checked_before_remove':True,'original_apk_sha256_checked_after_restore':True,'original_data_kept_during_package_remove':True,'device_alpha_compatibility_tested':False,'phone_beta_release_authorized':False,'before_sha256':before,'after_sha256':after}
+            return policy
+        
+        if __name__=='__main__':
+            if len(sys.argv)!=3:raise SystemExit('usage: r114_patch_concealment.py MAGISK_ROOT JSON_REPORT')
+            policy=patch(sys.argv[1])
+            out=Path(sys.argv[2]);out.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(policy,indent=2,sort_keys=True)+'\n')
+            print('R11.4 AVD-only source patch:',json.dumps({k:policy[k] for k in ('revision','scope','original_uninstall_requires_explicit_ui_tap','phone_beta_release_authorized')}))
+        PY_R114_SOURCE
+        python3 -m py_compile r114_patch_concealment.py
+        python3 r114_patch_concealment.py magisk reports/R114_EXPERIMENTAL_POLICY.json
+        git -C magisk diff --check
+        test -s reports/R114_EXPERIMENTAL_POLICY.json
 
     - name: R9.9 - Guard official on-device Direct Install (never replace Alpha by accident)
       shell: bash
@@ -3277,6 +3500,91 @@ jobs:
         PY_R11_MODULE_SUITE
         python3 -m py_compile r9_root_emulator.py
         python3 r9_root_emulator.py --selftest
+    - name: R11.4 - Observe genuine app concealment and restored original on AVD
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Observe app-driven package removal and its recovery; the test harness
+        # never removes/reinstalls a package on behalf of the app.
+        cat > r114_patch_harness.py <<'PY_R114_HARNESS'
+        #!/usr/bin/env python3
+        """R11.4 Android-13 QEMU-only end-to-end: APP-owned original removal and restore.
+        Strict: never let the TEST HARNESS uninstall the original package for the app.
+        """
+        from pathlib import Path
+        import hashlib,json,sys
+        
+        BEFORE='''        # R9.7 scope: existing original stays installed as research rollback.
+                # This is NOT proof that a detector cannot see its package name.
+                self.original_visible_while_hidden = 'package:' in self.adb('pm path ' + ORIGINAL, check=False)
+        '''
+        AFTER='''        # R11.4 AVD preflight: the ORIGINAL package must exist before the
+                # hidden app owns the concealment step. Test harness NEVER uninstalls it.
+                if 'package:' not in self.adb('pm path ' + ORIGINAL, check=False):
+                    raise RuntimeError('R11.4: original package absent BEFORE app-owned removal')
+        '''
+        ORIGINAL_STUB='''        self.mark('STUB_FOREGROUND')
+                xml = self.wait_stub_restore_ui()
+        '''
+        NEW_STUB='''        self.mark('STUB_FOREGROUND')
+                # Only the running hidden manager may perform the actual package change.
+                # The harness observes, but does not call pm uninstall or reinstall.
+                def finalize_visible():
+                    xml = self.ui_dump('r114_concealment_button')
+                    return xml if 'Complete Hide (AVD only)' in xml else None
+                xml = self.wait(finalize_visible, 'AVD-only app-managed hide confirmation', seconds=70)
+                find_node(xml, 'Complete Hide (AVD only)')
+                self.tap(xml, 'Complete Hide (AVD only)')
+                def app_original_removed():
+                    path = self.adb('pm path ' + ORIGINAL, check=False)
+                    return 'package:' not in path
+                self.wait(app_original_removed, 'app-owned original package removal', seconds=90)
+                self.original_visible_while_hidden = 'package:' in self.adb('pm path ' + ORIGINAL, check=False)
+                user_list = self.adb('pm list packages --user 0 ' + ORIGINAL)
+                if ('package:' + ORIGINAL) in user_list.splitlines():
+                    raise RuntimeError('R11.4: original package still listed for user 0')
+                if not self._focus_is(target):
+                    raise RuntimeError('R11.4: hidden manager lost foreground after original removal')
+                trace = self.adb("logcat -d -v brief -s 'R114Conceal:*'", check=False,
+                                 output='R114_APP_CONCEALMENT_TRACE.txt')
+                if 'ORIGINAL_UNINSTALLED_USER0_VERIFIED' not in trace:
+                    raise RuntimeError('R11.4: missing app-owned successful concealment trace')
+                self.mark('R114_CONCEALMENT_APP_CONFIRMED')
+                xml = self.wait_stub_restore_ui()
+        '''
+        ORIGINAL_RESTORE='''        self.mark('ORIGINAL_FOREGROUND')
+                self.ensure_su('MAGISK_SU_AFTER_RESTORE')
+        '''
+        NEW_RESTORE='''        self.mark('ORIGINAL_FOREGROUND')
+                if 'package:' not in self.adb('pm path ' + ORIGINAL, check=False):
+                    raise RuntimeError('R11.4: original package not reinstalled after restore')
+                self.mark('R114_ORIGINAL_REINSTALLED')
+                self.ensure_su('MAGISK_SU_AFTER_RESTORE')
+        '''
+        
+        def patch(src):
+            p=Path(src);s=p.read_text()
+            for title,original,new in [('old original visibility probe',BEFORE,AFTER),('app-owned hide gate',ORIGINAL_STUB,NEW_STUB),('restore post-condition',ORIGINAL_RESTORE,NEW_RESTORE)]:
+                occurrences=s.count(original)
+                if occurrences!=1:raise AssertionError(f'R11.4: {title} expected once; found {occurrences}')
+                s=s.replace(original,new,1)
+            if s.count('R114_CONCEALMENT_APP_CONFIRMED')!=1:raise AssertionError('R11.4 app proof stage missing')
+            if 'self.adb(\'pm uninstall' in s or 'self.adb(\'pm install' in s:
+                raise AssertionError('R11.4 test harness must never uninstall or install original itself')
+            p.write_text(s)
+            return {'revision':'R11.4','script_sha256':hashlib.sha256(s.encode()).hexdigest(),'harness_only_observes_package_visibility':True}
+        
+        if __name__=='__main__':
+            if len(sys.argv)!=3:raise SystemExit('usage: r114_patch_harness.py PYTEST JSON')
+            report=patch(sys.argv[1]);out=Path(sys.argv[2]);out.parent.mkdir(exist_ok=True,parents=True);out.write_text(json.dumps(report,indent=2)+'\n')
+            print('R11.4 harness checks installed:',report)
+        PY_R114_HARNESS
+        python3 -m py_compile r114_patch_harness.py
+        python3 r114_patch_harness.py r9_root_emulator.py reports/R114_HARNESS_POLICY.json
+        python3 -m py_compile r9_root_emulator.py
+        python3 r9_root_emulator.py --selftest
+        test -s reports/R114_HARNESS_POLICY.json
+
     - name: R8 - Enable hardware virtualization on GitHub Linux
       shell: bash
       run: |
@@ -3360,7 +3668,8 @@ jobs:
         r=json.loads(p.read_text())
         required=('AVD_ONLY','MAGISK_DAEMON_31100','MAGISK_SU',
                   'R11_MODULE_UI_VISIBLE','R11_MODULE_GUI_DISABLED','R11_MODULE_GUI_ENABLED',
-                  'R11_MODULE_CLI_INSTALL_STAGED','REQUESTER_BOUND','REQUESTER_CLEARED',
+                  'R11_MODULE_CLI_INSTALL_STAGED','R114_CONCEALMENT_APP_CONFIRMED',
+          'R114_ORIGINAL_REINSTALLED','REQUESTER_BOUND','REQUESTER_CLEARED',
                   'ORIGINAL_FOREGROUND','MAGISK_SU_AFTER_RESTORE')
         missing=[x for x in required if not r.get('checks',{}).get(x)]
         report={'source_run':'R11 rooted emulator','result':r.get('result'),

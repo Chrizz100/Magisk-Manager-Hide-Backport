@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R7 - Android 13 Isolated Emulator Smoke
+name: Magisk Manager-Hide R8 - Android 13 Real UI Navigation
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Rebuild pinned R6.4 for ARM and x86_64; test Android 13 emulator
+    name: Rebuild proven R6.4, verify real Android 13 GUI and Settings navigation
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     steps:
@@ -1136,137 +1136,240 @@ jobs:
           print('R6 stub.apk, app migration UI and native trusted certificate compiled PASS; research-only')
           PY_VERIFY
 
-      - name: R7 - Verify supported emulator ABI and write isolated smoke test
+      - name: R8 - Validate emulator ABI and create real GUI navigation test
         shell: bash
         run: |
           set -euo pipefail
           grep -Fq '"x86_64": "x86_64-linux-android"' magisk/build.py
           grep -Fxq 'abiList=arm64-v8a,armeabi-v7a,x86_64' r6-build.prop
           test -s magisk/out/app-release.apk
-          mkdir -p reports/r7_emulator
-          printf '%s\n' 'R7 API 33 x86_64 GUI smoke; no physical phone, no Magisk root daemon, no hide/restore operation.' > reports/r7_emulator/SCOPE.txt
-          cat > r7_emulator_smoke.sh <<'R7_SCRIPT'
+          grep -Fq 'Info.env.isActive && Info.env.versionCode == BuildConfig.APP_VERSION_CODE' magisk/app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeScreen.kt
+          mkdir -p reports/r8_emulator
+          printf '%s\n' 'R8 API 33 x86_64 navigation smoke; no physical phone, no Magisk daemon, no hide/restore operation.' > reports/r8_emulator/SCOPE.txt
+          cat > r8_emulator_gui.sh <<'R8_SCRIPT'
           #!/usr/bin/env bash
-          # Isolated Android 13 x86_64 emulator smoke test. NEVER install on a physical phone.
+          # R8: genuine UI navigation test on an isolated Android 13 x86_64 emulator.
+          # No Magisk daemon/root installation, hide/restore execution, or physical-device action.
           set -Eeuo pipefail
           PKG=com.topjohnwu.magisk
           ACT=com.topjohnwu.magisk/.ui.MainActivity
+          : "${GITHUB_WORKSPACE:?Only run in GitHub Actions emulator runner}"
           APK="$GITHUB_WORKSPACE/magisk/out/app-release.apk"
-          REPORT="$GITHUB_WORKSPACE/reports/r7_emulator"
+          REPORT="$GITHUB_WORKSPACE/reports/r8_emulator"
           mkdir -p "$REPORT"
-          printf 'OUTCOME=NOT_COMPLETED\n' > "$REPORT/result.env"
-          printf 'HIDE_RESTORE=NOT_TESTED_MAGISK_DAEMON_NOT_INSTALLED\n' >> "$REPORT/result.env"
-          printf 'ROOT_PERMISSIONS=NOT_TESTED_MAGISK_DAEMON_NOT_INSTALLED\n' >> "$REPORT/result.env"
-
+          printf 'OUTCOME=NOT_COMPLETED\nHIDE_RESTORE=NOT_TESTED_NO_MAGISK_DAEMON\nROOT_PERMISSIONS=NOT_TESTED_NO_MAGISK_DAEMON\n' > "$REPORT/result.env"
           mark() { printf '%s=%s\n' "$1" "$2" >> "$REPORT/result.env"; }
-          finalize() {
-            rc=$?
+          finish() {
+            local rc=$?
             trap - EXIT
             set +e
             adb logcat -d -v threadtime > "$REPORT/logcat.txt" 2>&1
-            adb shell dumpsys activity activities > "$REPORT/activities.txt" 2>&1
-            adb shell dumpsys window windows > "$REPORT/windows.txt" 2>&1
-            R7_EXIT_CODE="$rc" REPORT="$REPORT" python3 - <<'PY_STATUS'
-          import json,os,pathlib
+            adb shell dumpsys activity activities > "$REPORT/final_activities.txt" 2>&1
+            R8_RC="$rc" REPORT="$REPORT" python3 - <<'PY_REPORT'
+          import json,os,pathlib,re
           p=pathlib.Path(os.environ['REPORT'])
           flags={}
           for line in (p/'result.env').read_text().splitlines():
               if '=' in line:
-                  key,value=line.split('=',1);flags[key]=value
-          logs=(p/'logcat.txt').read_text(errors='replace') if (p/'logcat.txt').exists() else ''
-          crashes=[line for line in logs.splitlines() if 'Process: com.topjohnwu.magisk' in line]
-          report={
-            'base':'Official Magisk 31.1 source + the verified R6.4 patch series',
-            'test':'Android 13 API 33 x86_64 GUI smoke, NOT Magisk root hide end-to-end',
-            'checks':flags,
-            'exit_code':int(os.environ['R7_EXIT_CODE']),
-            'manager_fatal_process_lines':crashes[:15],
-            'hide_and_restore_tested':False,
-            'root_permissions_tested':False,
-            'physical_device_modified':False,
-            'result':'SMOKE_PASS' if int(os.environ['R7_EXIT_CODE'])==0 else 'SMOKE_FAILED_OR_INCOMPLETE',
-          }
-          (p/'R7_RESULT.json').write_text(json.dumps(report,indent=2,ensure_ascii=False)+'\n')
-          print('R7 report:',report['result'])
-          PY_STATUS
+                  a,b=line.split('=',1);flags[a]=b
+          required=[
+            'APK_PRESENT','ANDROID_13_X86_64_QEMU','APK_INSTALL','NOTIFICATION_PERMISSION_GRANTED',
+            'FOREGROUND_MAGISK_HOME','HOME_UI_VERIFIED','SETTINGS_NAVIGATION','SETTINGS_SCREEN_VERIFIED',
+            'BACK_TO_HOME','RELAUNCH_HOME_VERIFIED','NO_MANAGER_FATAL_EXCEPTION'
+          ]
+          missing=[k for k in required if flags.get(k)!='true']
+          crash=[]
+          lines=(p/'logcat.txt').read_text(errors='replace').splitlines() if (p/'logcat.txt').exists() else []
+          for i,line in enumerate(lines):
+              if 'FATAL EXCEPTION' in line and any(re.search(r'Process: com\.topjohnwu\.magisk(?:,|\s|$)',x) for x in lines[i+1:i+11]):
+                  crash.append(line)
+          success=int(os.environ['R8_RC'])==0 and not missing and not crash
+          out={
+           'base':'Pinned Magisk 31.1 + unchanged R6.4 patches',
+           'test':'Real Android 13 API 33 x86_64 emulator GUI navigation after permission grant',
+           'checks':flags,'missing_checks':missing,'manager_fatal_exceptions':crash[:10],
+           'root_daemon_installed':False,'hide_and_restore_tested':False,'root_permissions_tested':False,
+           'physical_device_modified':False,'result':'GUI_PASS' if success else 'GUI_FAILED_OR_INCOMPLETE',
+           'original_exit_code':int(os.environ['R8_RC'])}
+          (p/'R8_RESULT.json').write_text(json.dumps(out,indent=2,ensure_ascii=False)+'\n')
+          print('R8 actual GUI outcome:',out['result'])
+          PY_REPORT
             exit "$rc"
           }
-          trap finalize EXIT
-
-          : "${GITHUB_WORKSPACE:?Only run in GitHub Actions test runner}"
+          trap finish EXIT
+          
+          # Strict emulator gate: prevents accidental execution on a connected real device.
           test -s "$APK"
           mark APK_PRESENT true
           adb wait-for-device
           SDK="$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
           ABI="$(adb shell getprop ro.product.cpu.abi | tr -d '\r')"
-          MARKER="$(adb shell getprop ro.kernel.qemu | tr -d '\r')"
-          printf 'API=%s\nABI=%s\nQEMU=%s\n' "$SDK" "$ABI" "$MARKER" | tee "$REPORT/device.txt"
-          if [ "$SDK" != 33 ] || [ "$ABI" != x86_64 ] || [ "$MARKER" != 1 ]; then
-            echo 'R7: refuse testing on a non-Android-13 x86_64 emulator' >&2
+          QEMU="$(adb shell getprop ro.kernel.qemu | tr -d '\r')"
+          printf 'API=%s\nABI=%s\nQEMU=%s\n' "$SDK" "$ABI" "$QEMU" | tee "$REPORT/device.txt"
+          if [ "$SDK" != 33 ] || [ "$ABI" != x86_64 ] || [ "$QEMU" != 1 ]; then
+            echo 'R8: refusing non-Android-13 x86_64 emulator' >&2
             exit 2
           fi
-          mark DEVICE_ANDROID13_X86_64_EMULATOR true
-
+          mark ANDROID_13_X86_64_QEMU true
           adb logcat -c
           adb install -r "$APK" 2>&1 | tee "$REPORT/install.txt"
           mark APK_INSTALL true
-          adb shell pm path "$PKG" | tee "$REPORT/package_path.txt" | grep -F 'package:'
-          mark PACKAGE_REGISTERED true
-
+          adb shell pm path "$PKG" | tee "$REPORT/package_path.txt" | grep -q 'package:'
+          
+          # Grant the standard Android 13 notification runtime permission in this disposable
+          # emulator only. This avoids incorrectly counting a permission dialog as app UI.
+          adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS
+          mark NOTIFICATION_PERMISSION_GRANTED true
+          adb shell am force-stop "$PKG"
           adb shell am start -W -n "$ACT" | tee "$REPORT/first_launch.txt"
-          sleep 12
-          adb shell pidof "$PKG" | tee "$REPORT/first_pid.txt" | grep -Eq '[0-9]'
-          mark FIRST_LAUNCH_PROCESS true
-          adb exec-out screencap -p > "$REPORT/launch.png"
-          test -s "$REPORT/launch.png"
-          mark SCREENSHOT_CAPTURED true
-
-          # The following is not a privileged app-hiding test: only process restart.
+          sleep 6
+          
+          assert_focus() {
+            local label="$1"
+            local file="$REPORT/${label}_activities.txt"
+            adb shell dumpsys activity activities > "$file"
+            python3 - "$file" <<'PY_FOCUS'
+          import pathlib,re,sys
+          s=pathlib.Path(sys.argv[1]).read_text(errors='replace')
+          if not re.search(r'topResumedActivity\s*=\s*ActivityRecord\{[^\n]*com\.topjohnwu\.magisk/\.ui\.MainActivity',s):
+              sys.exit('Magisk MainActivity is not the top-resumed app')
+          PY_FOCUS
+          }
+          
+          dump_ui() {
+            local name="$1"
+            local dest="$REPORT/${name}.xml" remote="/sdcard/r8_${name}.xml"
+            local n
+            for n in 1 2 3; do
+              if timeout 55s adb shell uiautomator dump "$remote" > "$REPORT/${name}_ui_dump_${n}.txt" 2>&1 && \
+                 adb pull "$remote" "$dest" > "$REPORT/${name}_adb_pull_${n}.txt" 2>&1 && \
+                 python3 - "$dest" <<'PY_XML'
+          import pathlib,sys,xml.etree.ElementTree as ET
+          p=pathlib.Path(sys.argv[1]);root=ET.parse(p).getroot()
+          assert root.tag=='hierarchy' and list(root.iter('node'))
+          PY_XML
+              then return 0; fi
+              sleep 2
+            done
+            echo "R8: failed to read actual foreground UI hierarchy: $name" >&2
+            return 1
+          }
+          
+          # Assertions match observed English Android-13 test image and real Compose UI.
+          ui_assert() {
+            local doc="$1" kind="$2"
+            python3 - "$doc" "$kind" <<'PY_UI'
+          import pathlib,sys,xml.etree.ElementTree as ET
+          root=ET.parse(sys.argv[1]).getroot();mode=sys.argv[2]
+          nodes=list(root.iter('node'))
+          active=[n for n in nodes if n.get('package')=='com.topjohnwu.magisk']
+          if not active:
+              sys.exit('Foreground UI hierarchy does not contain Magisk package')
+          if any(n.get('package','').endswith('permissioncontroller') for n in nodes):
+              sys.exit('Android runtime-permission popup still covers the GUI')
+          texts={v.strip() for n in nodes for v in (n.get('text',''),n.get('content-desc','')) if v.strip()}
+          if mode=='home':
+              required={'Home','Magisk'}
+          elif mode=='settings':
+              required={'Settings','Customization'}
+          else:sys.exit('unknown screen test')
+          missing=required-texts
+          if missing:sys.exit(f'Actual {mode} UI is missing expected labels: {missing}. Visible={sorted(texts)[:45]}')
+          print(f'R8 {mode} GUI labels and package: PASS; visible={sorted(texts)[:18]}')
+          PY_UI
+          }
+          
+          ui_tap() {
+            local xml="$1" label="$2" xy
+            xy="$(python3 - "$xml" "$label" <<'PY_TAP'
+          import re,sys,xml.etree.ElementTree as ET
+          root=ET.parse(sys.argv[1]).getroot();label=sys.argv[2]
+          found=[]
+          for n in root.iter('node'):
+              if label not in {n.get('text'),n.get('content-desc')}:continue
+              m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',n.get('bounds',''))
+              if m:
+                  x1,y1,x2,y2=map(int,m.groups())
+                  if x2>x1 and y2>y1:found.append(((y1+y2)//2,(x1+x2)//2))
+          if not found:sys.exit('Cannot locate requested navigation item: '+label)
+          # Prefer bottom navigation; ignores similarly-named title in top bar.
+          y,x=max(found)
+          print(x,y)
+          PY_TAP
+          )"
+            local x y
+            read -r x y <<< "$xy"
+            printf 'Tap %s at %s,%s\n' "$label" "$x" "$y" | tee -a "$REPORT/navigation.txt"
+            adb shell input tap "$x" "$y"
+          }
+          
+          assert_focus first_home
+          mark FOREGROUND_MAGISK_HOME true
+          dump_ui first_home
+          ui_assert "$REPORT/first_home.xml" home
+          mark HOME_UI_VERIFIED true
+          adb exec-out screencap -p > "$REPORT/home.png"
+          test -s "$REPORT/home.png"
+          
+          ui_tap "$REPORT/first_home.xml" Settings
+          sleep 3
+          assert_focus settings
+          dump_ui settings
+          ui_assert "$REPORT/settings.xml" settings
+          mark SETTINGS_NAVIGATION true
+          mark SETTINGS_SCREEN_VERIFIED true
+          adb exec-out screencap -p > "$REPORT/settings.png"
+          test -s "$REPORT/settings.png"
+          
+          ui_tap "$REPORT/settings.xml" Home
+          sleep 2
+          assert_focus returned_home
+          dump_ui returned_home
+          ui_assert "$REPORT/returned_home.xml" home
+          mark BACK_TO_HOME true
+          
           adb shell am force-stop "$PKG"
           adb shell am start -W -n "$ACT" | tee "$REPORT/relaunch.txt"
-          sleep 8
-          adb shell pidof "$PKG" | tee "$REPORT/relaunch_pid.txt" | grep -Eq '[0-9]'
-          mark RELAUNCH_PROCESS true
+          sleep 5
+          assert_focus relaunch
+          dump_ui relaunch
+          ui_assert "$REPORT/relaunch.xml" home
           adb exec-out screencap -p > "$REPORT/relaunch.png"
           test -s "$REPORT/relaunch.png"
-
-          # Attempt a non-invasive dump of the user-visible screen. Failures here do
-          # not affect the actual install/process smoke result.
-          if timeout 50s adb shell uiautomator dump /sdcard/r7_screen.xml > "$REPORT/uiautomator.txt" 2>&1; then
-            adb pull /sdcard/r7_screen.xml "$REPORT/window.xml" >/dev/null 2>&1 || true
-          fi
+          mark RELAUNCH_HOME_VERIFIED true
+          
+          # Root-based repackaging deliberately NOT exercised on an unrooted emulator.
+          # Record whether this image is debuggable for planning a future isolated daemon test.
+          adb shell getprop ro.debuggable | tr -d '\r' > "$REPORT/ro_debuggable.txt" || true
           adb logcat -d -v threadtime > "$REPORT/logcat.txt" 2>&1
-          R7_LOG="$REPORT/logcat.txt" python3 - <<'PY_CRASH'
+          R8_LOG="$REPORT/logcat.txt" python3 - <<'PY_CRASH'
           import os,pathlib,re,sys
-          logs=pathlib.Path(os.environ['R7_LOG']).read_text(errors='replace')
-          # An AndroidRuntime FATAL EXCEPTION naming the Magisk process is a hard failure.
-          lines=logs.splitlines()
-          for idx,line in enumerate(lines):
-              if 'FATAL EXCEPTION' not in line: continue
-              if any(re.search(r'Process: com\.topjohnwu\.magisk(?:,|\s|$)', l) for l in lines[idx+1:idx+10]):
-                  sys.exit('R7: the manager process crashed (AndroidRuntime FATAL EXCEPTION)')
-          print('No Magisk-process FATAL EXCEPTION in emulator logcat')
+          s=pathlib.Path(os.environ['R8_LOG']).read_text(errors='replace').splitlines()
+          for i,line in enumerate(s):
+              if 'FATAL EXCEPTION' in line and any(re.search(r'Process: com\.topjohnwu\.magisk(?:,|\s|$)',v) for v in s[i+1:i+11]):
+                  sys.exit('R8: FATAL EXCEPTION in Magisk app process')
+          print('No Magisk-process FATAL EXCEPTION in Android logcat')
           PY_CRASH
-          mark NO_DETECTED_FATAL_PROCESS_CRASH true
-          sed -i 's/^OUTCOME=NOT_COMPLETED$/OUTCOME=SMOKE_PASS/' "$REPORT/result.env"
-          echo 'Emulator GUI smoke PASS; hide/restore and Magisk root privileges NOT TESTED.'
-          R7_SCRIPT
-          bash -n r7_emulator_smoke.sh
-          chmod 0700 r7_emulator_smoke.sh
-          echo 'R7 emulator script and ABI compatibility: PASS'
+          mark NO_MANAGER_FATAL_EXCEPTION true
+          sed -i 's/^OUTCOME=NOT_COMPLETED$/OUTCOME=GUI_PASS/' "$REPORT/result.env"
+          echo 'R8 real GUI navigation PASS: Home -> Settings -> Home -> relaunch. Hide/restore NOT TESTED.'
+          R8_SCRIPT
+          bash -n r8_emulator_gui.sh
+          chmod 0700 r8_emulator_gui.sh
+          echo 'R8 emulator GUI script and ABI compatibility: PASS'
 
-      - name: R7 - Enable hardware virtualization on GitHub's Linux runner
+      - name: R8 - Enable hardware virtualization on GitHub Linux
         shell: bash
         run: |
           set -euo pipefail
           if [ ! -e /dev/kvm ]; then
-            echo 'NO_KVM_ON_RUNNER: Android emulator unavailable on this runner' | tee reports/r7_emulator/ENVIRONMENT_BLOCKER.txt
+            echo 'NO_KVM_ON_RUNNER: Android emulator unavailable on this runner' | tee reports/r8_emulator/ENVIRONMENT_BLOCKER.txt
             exit 1
           fi
           sudo chmod 0666 /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
 
-      - name: R7 - Android 13 Google APIs x86_64 manager GUI smoke (EMULATOR ONLY)
+      - name: R8 - Android 13 x86_64 interactive GUI navigation (EMULATOR ONLY)
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 33
@@ -1277,36 +1380,37 @@ jobs:
           ram-size: 3072M
           emulator-boot-timeout: 900
           emulator-options: -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -camera-back none
-          script: bash r7_emulator_smoke.sh
+          script: bash r8_emulator_gui.sh
 
-      - name: R7 - Ensure emulator reported outcome honestly
+      - name: R8 - Verify actual UI outcome and untested root scope
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p reports/r7_emulator
-          if [ ! -f reports/r7_emulator/R7_RESULT.json ]; then
-            printf '%s\n' 'EMULATOR_NOT_COMPLETED: no result from Android smoke script' > reports/r7_emulator/EMULATOR_NOT_COMPLETED.txt
+          mkdir -p reports/r8_emulator
+          if [ ! -f reports/r8_emulator/R8_RESULT.json ]; then
+            printf '%s\n' 'EMULATOR_NOT_COMPLETED: no R8 GUI result file' > reports/r8_emulator/EMULATOR_NOT_COMPLETED.txt
           fi
-          python3 - <<'R7_STATUS'
+          python3 - <<'R8_STATUS'
           from pathlib import Path
           import json
-          p=Path('reports/r7_emulator/R7_RESULT.json')
+          p=Path('reports/r8_emulator/R8_RESULT.json')
           if p.is_file():
               o=json.loads(p.read_text())
               assert o['hide_and_restore_tested'] is False
               assert o['root_permissions_tested'] is False
               assert o['physical_device_modified'] is False
-              print('R7 actual emulator outcome:',o['result'])
+              assert o['result']=='GUI_PASS', 'R8 real GUI navigation did not pass'
+              print('R8 actual GUI outcome:',o['result'])
           else:
-              print('R7 emulator did not complete; see logs and environment blocker')
-          R7_STATUS
+              raise SystemExit('R8 emulator has not produced a real GUI result; see logs')
+          R8_STATUS
 
       - name: Upload compiler and source evidence only (no APK, no signing key)
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: R7_ANDROID13_EMULATOR_EVIDENCE_NO_APK
+          name: R8_ANDROID13_GUI_NAVIGATION_EVIDENCE_NO_APK
           path: reports/
           if-no-files-found: error
           retention-days: 14

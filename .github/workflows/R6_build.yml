@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R9.2 - Reliable Gradle Build and Root Emulator
+name: Magisk Manager-Hide R9.3 - Wait for Android services after root emulator restart
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -1812,7 +1812,7 @@ jobs:
           cat > r9_root_emulator.py <<'PY_R9_SCRIPT'
           #!/usr/bin/env python3
           """R9: strict API-33 AVD-only Magisk daemon + manager hide/restore smoke.
-          
+
           Research-only. Never run on a physical device. All changes take place on a
           throwaway emulator using a freshly built research APK and temporary CI key.
           """
@@ -1825,17 +1825,18 @@ jobs:
           import time
           import xml.etree.ElementTree as ET
           from pathlib import Path
-          
+
           ORIGINAL = 'com.topjohnwu.magisk'
           ACTIVITY = ORIGINAL + '/.ui.MainActivity'
           EXPECTED = {'ro.kernel.qemu': '1', 'ro.build.version.sdk': '33', 'ro.product.cpu.abi': 'x86_64'}
           PACKAGE_RE = re.compile(r'[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+')
           REQUIRED_STAGES = ('AVD_ONLY', 'ADB_ROOT', 'MAGISK_DAEMON_31100', 'MAGISK_SU',
+                             'ANDROID_FRAMEWORK_RESTORED',
                              'HIDE_BUTTON', 'HIDE_DIALOG', 'STUB_INSTALLED', 'REQUESTER_BOUND',
                              'STUB_FOREGROUND', 'STUB_RESTORE_BUTTON', 'RESTORE_DIALOG',
                              'REQUESTER_CLEARED', 'ORIGINAL_FOREGROUND', 'MAGISK_SU_AFTER_RESTORE')
-          
-          
+
+
           def extract_requester(output):
               lines = [line.strip() for line in output.splitlines() if line.startswith('value=')]
               if not lines:
@@ -1846,8 +1847,8 @@ jobs:
               if value and (not PACKAGE_RE.fullmatch(value) or value == ORIGINAL):
                   raise RuntimeError('Malformed requester DB value')
               return value
-          
-          
+
+
           def find_node(xml_text, label):
               root = ET.fromstring(xml_text)
               for node in root.iter('node'):
@@ -1860,8 +1861,8 @@ jobs:
                   if x1 > x0 and y1 > y0:
                       return ((x0 + x1) // 2, (y0 + y1) // 2)
               raise RuntimeError('UI element not found: ' + label)
-          
-          
+
+
           def test_pure():
               x = '<hierarchy><node text="Hide the Magisk app" bounds="[12,20][52,80]" /></hierarchy>'
               assert find_node(x, 'Hide the Magisk app') == (32, 50)
@@ -1876,8 +1877,8 @@ jobs:
               assert extract_requester('value=abc.def\n') == 'abc.def'
               assert len(REQUIRED_STAGES) == len(set(REQUIRED_STAGES))
               print('R9_SELFTEST_PASS: XML bounds, DB validation, unique strict gates')
-          
-          
+
+
           class R9:
               def __init__(self):
                   self.workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
@@ -1890,7 +1891,7 @@ jobs:
                   self.error = None
                   self.root_setup_started = False
                   self.restored_by_ui = False
-          
+
               def cmd(self, argv, *, timeout=45, check=True, output=None, cwd=None):
                   try:
                       p = subprocess.run(argv, cwd=cwd, text=True, errors='replace',
@@ -1903,14 +1904,14 @@ jobs:
                       return p.stdout.strip()
                   except subprocess.TimeoutExpired as e:
                       raise RuntimeError('Timed out: ' + str(argv[:3])) from e
-          
+
               def adb(self, remote, *, timeout=45, check=True, output=None):
                   return self.cmd(['adb', 'shell', remote], timeout=timeout, check=check, output=output)
-          
+
               def mark(self, stage):
                   self.stages[stage] = True
                   print('R9_PASS:', stage, flush=True)
-          
+
               def identity(self):
                   devices = [line.split()[0] for line in self.cmd(['adb', 'devices']).splitlines()[1:]
                              if line.strip() and line.split()[-1] == 'device']
@@ -1922,16 +1923,16 @@ jobs:
                   if any(info.get(key) != expected for key, expected in EXPECTED.items()):
                       raise RuntimeError('Strict R9 gate: wrong device: ' + str(info))
                   self.mark('AVD_ONLY')
-          
+
               def requester(self):
                   sql = 'SELECT value FROM settings WHERE key="requester" LIMIT 1'
                   remote = '/data/adb/magisk/magisk --sqlite ' + shlex.quote(sql)
                   return extract_requester(self.adb(remote))
-          
+
               def sqlite_clear_requester(self):
                   sql = 'DELETE FROM settings WHERE key="requester"'
                   return self.adb('/data/adb/magisk/magisk --sqlite ' + shlex.quote(sql), check=False)
-          
+
               def ui_dump(self, label):
                   dest = self.report / (label + '.xml')
                   remote = '/sdcard/r9_' + label + '.xml'
@@ -1947,18 +1948,18 @@ jobs:
                               raise
                           time.sleep(2)
                   raise RuntimeError('unreachable')
-          
+
               def tap(self, xml, text):
                   x, y = find_node(xml, text)
                   self.adb(f'input tap {x} {y}')
                   time.sleep(2)
-          
+
               def focus(self, expected):
                   data = self.adb('dumpsys activity activities', output='activity_' + expected.replace('.', '_') + '.txt')
                   matches = re.findall(r'topResumedActivity\s*=\s*ActivityRecord\{[^\n]*', data)
                   if not matches or not any((expected + '/') in s for s in matches):
                       raise RuntimeError('Expected top-resumed package is absent: ' + expected)
-          
+
               def wait(self, action, description, seconds=75):
                   deadline = time.monotonic() + seconds
                   last = None
@@ -1971,7 +1972,7 @@ jobs:
                           last = e
                       time.sleep(3)
                   raise RuntimeError('Timed out waiting for ' + description + (' (' + str(last) + ')' if last else ''))
-          
+
               def root_setup(self):
                   self.identity()  # BEFORE any privilege escalation or installation
                   if not self.apk.is_file() or self.apk.stat().st_size < 1_000_000:
@@ -1996,17 +1997,72 @@ jobs:
                       raise RuntimeError('Unexpected Magisk daemon version code: ' + version)
                   self.mark('MAGISK_DAEMON_31100')
                   self.ensure_su('MAGISK_SU')
-          
+                  self.wait_for_framework()  # official avd_setup.sh restarts zygote/system_server
+
+              def wait_for_framework(self, *, timeout_seconds=180, poll_seconds=3):
+                  """After official avd_setup.sh stop/start, wait for system_server services.
+
+                  'adb wait-for-device' only proves adbd is responding, NOT that Android's
+                  ActivityManager/PackageManager have finished restarting. Never issue
+                  UI interactions before both service binders and boot have recovered.
+                  """
+                  if not self.stages.get('AVD_ONLY') or not self.stages.get('ADB_ROOT'):
+                      raise RuntimeError('Framework wait requires verified AVD and ADB root')
+                  deadline = time.monotonic() + timeout_seconds
+                  log = self.report / 'framework_wait.jsonl'
+                  consecutive = 0
+                  attempts = 0
+                  probes = (
+                      ('zygote', 'getprop init.svc.zygote'),
+                      ('boot', 'getprop sys.boot_completed'),
+                      ('activity', 'service check activity'),
+                      ('package', 'service check package'),
+                      ('manager', 'pm path ' + ORIGINAL),
+                  )
+                  last = {}
+                  while time.monotonic() < deadline:
+                      attempts += 1
+                      status = {}
+                      for name, remote in probes:
+                          try:
+                              status[name] = self.adb(remote, check=False, timeout=12)
+                          except RuntimeError as exc:
+                              status[name] = 'ADB_ERROR: ' + str(exc)[:220]
+                      ready = (
+                          status['zygote'] == 'running'
+                          and status['boot'] == '1'
+                          and 'Service activity: found' in status['activity']
+                          and 'Service package: found' in status['package']
+                          and 'package:' in status['manager']
+                      )
+                      consecutive = consecutive + 1 if ready else 0
+                      last = status
+                      with log.open('a') as f:
+                          f.write(json.dumps({'attempt': attempts, 'ready': ready,
+                                              'stable_passes': consecutive, 'services': status}) + '\n')
+                      if consecutive >= 2:
+                          self.mark('ANDROID_FRAMEWORK_RESTORED')
+                          return
+                      time.sleep(poll_seconds)
+                  try:
+                      self.adb('logcat -d -t 400', timeout=35, check=False,
+                               output='framework_recovery_logcat.txt')
+                  except RuntimeError:
+                      pass
+                  raise RuntimeError('Android services not recovered after official Magisk AVD stop/start'
+                                     ' (activity, package, boot); see framework_wait.jsonl. '
+                                     + json.dumps(last))
+
               def requester_or_unavailable(self):
                   # Before activating the daemon its database might not exist.
                   return self.adb('test -f /data/adb/magisk.db && echo present || true') == 'present'
-          
+
               def ensure_su(self, stage):
                   result = self.adb('/debug_ramdisk/su -c id', timeout=40)
                   if 'uid=0(' not in result:
                       raise RuntimeError('Magisk SU did not grant uid=0: ' + result)
                   self.mark(stage)
-          
+
               def enable_gui(self):
                   self.adb('am force-stop ' + ORIGINAL)
                   self.adb('am start -W -n ' + ACTIVITY, timeout=50)
@@ -2022,7 +2078,7 @@ jobs:
                   find_node(dialog, 'OK')
                   self.mark('HIDE_DIALOG')
                   self.tap(dialog, 'OK')
-          
+
               def hide_verify(self):
                   target = self.wait(self.requester, 'new requester DB binding')
                   self.target = target
@@ -2044,11 +2100,11 @@ jobs:
                   find_node(dialog, 'OK')
                   self.mark('RESTORE_DIALOG')
                   self.tap(dialog, 'OK')
-          
+
               def _focus_is(self, package):
                   data = self.adb('dumpsys activity activities')
                   return any(package + '/' in m for m in re.findall(r'topResumedActivity\s*=\s*ActivityRecord\{[^\n]*', data))
-          
+
               def restore_verify(self):
                   self.wait(lambda: self.requester() == '', 'cleared Magisk requester binding')
                   self.mark('REQUESTER_CLEARED')
@@ -2060,7 +2116,7 @@ jobs:
                   self.mark('ORIGINAL_FOREGROUND')
                   self.ensure_su('MAGISK_SU_AFTER_RESTORE')
                   self.restored_by_ui = True
-          
+
               def cleanup(self):
                   if not self.stages.get('AVD_ONLY'):
                       return
@@ -2078,7 +2134,7 @@ jobs:
                                        output='emulator_stub_cleanup.txt')
                           except Exception as e:
                               (self.report / 'stub_cleanup_error.txt').write_text(str(e) + '\n')
-          
+
               def finish(self):
                   if self.stages.get('AVD_ONLY'):
                       try:
@@ -2102,7 +2158,7 @@ jobs:
                   if self.error:
                       print('R9 FAILED STAGE:', self.error, file=sys.stderr, flush=True)
                   return 0 if ok else 1
-          
+
               def run(self):
                   try:
                       self.root_setup()
@@ -2114,8 +2170,8 @@ jobs:
                   finally:
                       self.cleanup()
                       return self.finish()
-          
-          
+
+
           if __name__ == '__main__':
               if len(sys.argv) == 2 and sys.argv[1] == '--selftest':
                   test_pure()

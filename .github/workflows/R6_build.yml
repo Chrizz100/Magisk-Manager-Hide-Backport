@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R9.1 - Verified BusyBox/bootctl and Root Emulator
+name: Magisk Manager-Hide R9.2 - Reliable Gradle Build and Root Emulator
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Build pinned R6.4 with verified core assets, then R8 GUI and R9 root test
+    name: Verified Magisk 31.1 build with Gradle retry, then R8 GUI and R9 root test
     runs-on: ubuntu-24.04
     timeout-minutes: 115
     steps:
@@ -1499,11 +1499,45 @@ jobs:
           EOF
           keytool -list -keystore "$GITHUB_WORKSPACE/magisk/r6-ci-only.p12" -storepass 'R6-Test-Only' -alias r6-research >/dev/null
 
+      - name: R9.2 - Restore Gradle dependency cache
+        id: r92_gradle_cache
+        uses: actions/cache/restore@v4
+        with:
+          # Compiled dependency jars, not the build outputs, test APK or credentials.
+          path: ~/.gradle/caches/modules-2/files-2.1
+          key: magisk-r92-gradle971-0972f67d-kotlin240-dependencies-v1
+
       - name: Compile signed research Magisk 31.1 with R6 migration and stub.apk
+        id: r92_compile
         shell: bash
         run: |
           set -euo pipefail
-          (cd magisk && python3 build.py -vr -c ../r6-build.prop all) 2>&1 | tee reports/full_build.log
+          # Existing R9.1 Magisk source and build logic are unchanged. Retry ONLY
+          # for temporary HTTP/network failures while keeping Gradle's downloads.
+          # Do not turn compiler errors into retries or report a false success.
+          for attempt in 1 2 3; do
+            echo "R9.2 complete Magisk build attempt ${attempt}/3"
+            log="reports/full_build_attempt_${attempt}.log"
+            if (cd magisk && python3 build.py -vr -c ../r6-build.prop all) 2>&1 | tee "$log"; then
+              cp "$log" reports/full_build.log
+              printf 'BUILD_PASS_ON_ATTEMPT=%s\n' "$attempt" > reports/R92_BUILD_RETRY_STATUS.txt
+              break
+            fi
+            cp "$log" reports/full_build.log
+            if ! grep -Eiq 'HTTP[^0-9]*5[0-9][0-9]|status code[^0-9]*5[0-9][0-9]|Received status code 5[0-9][0-9]|Gateway Time-out|Gateway Timeout|Service Unavailable|Connection reset|Connection timed out|Read timed out|Remote host terminated|Temporary failure in name resolution|UnknownHostException|TLS handshake' "$log"; then
+              printf 'NON_TRANSIENT_BUILD_FAILURE_AT_ATTEMPT=%s\n' "$attempt" > reports/R92_BUILD_RETRY_STATUS.txt
+              echo 'R9.2: compiler / non-transient failure: refusing blind retries' >&2
+              exit 1
+            fi
+            if [ "$attempt" -ge 3 ]; then
+              printf 'TRANSIENT_DOWNLOAD_FAILURE_AFTER_THREE_ATTEMPTS\n' > reports/R92_BUILD_RETRY_STATUS.txt
+              echo 'R9.2: dependency download still failing after three attempts' >&2
+              exit 1
+            fi
+            echo "R9.2: transient download problem; retain verified Gradle cache and retry."
+            sleep "$((attempt * 12))"
+          done
+          test -s magisk/out/app-release.apk
           python3 - <<'PY_VERIFY'
           import hashlib, pathlib, zipfile
           root=pathlib.Path('magisk/out')
@@ -1535,6 +1569,13 @@ jobs:
           )
           print('R6 stub.apk, app migration UI and native trusted certificate compiled PASS; research-only')
           PY_VERIFY
+
+      - name: R9.2 - Save Gradle dependencies only after successful compile
+        if: ${{ steps.r92_compile.outcome == 'success' && steps.r92_gradle_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.gradle/caches/modules-2/files-2.1
+          key: magisk-r92-gradle971-0972f67d-kotlin240-dependencies-v1
 
       - name: R8 - Validate emulator ABI and create real GUI navigation test
         shell: bash
@@ -2101,6 +2142,7 @@ jobs:
           test -r /dev/kvm && test -w /dev/kvm
 
       - name: R8 - Android 13 x86_64 interactive GUI navigation (EMULATOR ONLY)
+        id: r92_emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 33
@@ -2114,7 +2156,7 @@ jobs:
           script: bash r8_emulator_gui.sh && python3 r9_root_emulator.py
 
       - name: R8 - Verify actual UI outcome and untested root scope
-        if: always()
+        if: ${{ steps.r92_emulator.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2138,7 +2180,7 @@ jobs:
           R8_STATUS
 
       - name: R9 - Verify real Root + Hide + Restore (never infer from R8 success)
-        if: always()
+        if: ${{ steps.r92_emulator.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2159,6 +2201,43 @@ jobs:
           assert result['result']=='ROOT_HIDE_RESTORE_PASS', result.get('error') or result.get('missing_checks')
           print('R9 confirmed full manager hide+restore with real Magisk service')
           PY_R9_RESULT
+
+      - name: R9.2 - Summarize primary failure instead of duplicating it
+        if: always()
+        env:
+          R92_BUILD_OUTCOME: ${{ steps.r92_compile.outcome }}
+          R92_EMULATOR_OUTCOME: ${{ steps.r92_emulator.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PHASES'
+          import json, os
+          from pathlib import Path
+          build=os.environ['R92_BUILD_OUTCOME']
+          emulator=os.environ['R92_EMULATOR_OUTCOME']
+          if build=='failure':
+              result='BUILD_FAILED_EMULATOR_NOT_RUN'
+          elif build!='success':
+              result='PREBUILD_FAILED_OR_SKIPPED'
+          elif emulator!='success':
+              result='EMULATOR_FAILED_OR_NOT_EXECUTED'
+          else:
+              report=Path('reports/r9_emulator/R9_RESULT.json')
+              if report.exists():
+                  outcome=json.loads(report.read_text())
+                  result=outcome.get('result','R9_RESULT_UNKNOWN')
+              else:
+                  result='MISSING_R9_RESULT'
+          out={'compile':build,'emulator':emulator,'overall':result,
+               'physical_device_modified':False,
+               'scope':'research-only official Android 13 x86_64 emulator'}
+          Path('reports/R92_PRIMARY_STATUS.json').write_text(json.dumps(out,indent=2)+'\n')
+          print('R9.2 primary status:',result)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('### R9.2 build & emulator result\n')
+              f.write(f"- Build: `{build}`\n- Emulator: `{emulator}`\n- Primary status: `{result}`\n")
+              f.write('- No APK/signing key distributed; no physical device modified.\n')
+          PY_PHASES
 
       - name: Upload compiler and source evidence only (no APK, no signing key)
         if: always()

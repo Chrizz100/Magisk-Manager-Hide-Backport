@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R9.4 - Regrant Android 13 permission after Magisk AVD setup
+name: Magisk Manager-Hide R9.5 - Restore pinned historical Stub APK resources
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -933,6 +933,50 @@ jobs:
             magisk/app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeScreen.kt \
             magisk/app/apk/src/main/java/com/topjohnwu/magisk/ui/home/HomeViewModel.kt \
             magisk/app/core/src/main/res/values/strings.xml > reports/R6_source_SHA256SUMS.txt
+
+      - name: R9.5 - Restore pinned Magisk Stub resources and component mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit='0972f67d97f9b6302b67c5171283330c74114b4a'
+          legacy_commit='ea16c8141eb64dc28b56a0e7fb536689ef465429'
+          path='app/core/src/main/java/com/topjohnwu/magisk/core/Hacks.kt'
+          original_blob='3cae9af7858dca211f5abad6ae0f0f58aa13566e'
+          legacy_blob='7bcf46aa4c287105d32baaedd5d69d8af3b1bc83'
+          test "$(git -C magisk rev-parse HEAD)" = "$source_commit"
+          test "$(git -C magisk hash-object "$path")" = "$original_blob"
+          test "$(git -C magisk rev-parse "$legacy_commit:$path")" = "$legacy_blob"
+          # Restore exactly the upstream code predating Manager-Hide removal.
+          # On Android 13 this adds the dynamically loaded full APK resources
+          # before ContentProvider initialization, and maps stub components.
+          git -C magisk show "$legacy_commit:$path" > "magisk/$path"
+          test "$(git -C magisk hash-object "$path")" = "$legacy_blob"
+          python3 - <<'R95_RESOURCE_CONTRACT'
+          from pathlib import Path
+          import json
+          path = Path('magisk/app/core/src/main/java/com/topjohnwu/magisk/core/Hacks.kt')
+          s = path.read_text()
+          assert 'import com.topjohnwu.magisk.StubApk' in s
+          assert 'fun Resources.addAssetPath(path: String) = StubApk.addAssetPath(this, path)' in s
+          assert 'if (isRunningAsStub)\n        addAssetPath(AppApkPath)' in s
+          assert 'Info.stub?.classToComponent?.get(name) ?: name' in s
+          ctx = Path('magisk/app/core/src/main/java/com/topjohnwu/magisk/core/AppContext.kt').read_text()
+          assert 'StubApk.current(base).path' in ctx
+          stub = Path('magisk/app/shared/src/main/java/com/topjohnwu/magisk/StubApk.java').read_text()
+          assert 'res.addLoaders(getResourcesLoader(new File(path)))' in stub
+          assert 'ResourcesProvider.loadFromApk(fd)' in stub
+          Path('reports/R95_HISTORICAL_STUB_RESOURCES.json').write_text(json.dumps({
+              'result':'PINNED_LEGACY_STUB_RESOURCE_BRIDGE_RESTORED',
+              'upstream_commit':'ea16c8141eb64dc28b56a0e7fb536689ef465429',
+              'old_worktree_blob':'3cae9af7858dca211f5abad6ae0f0f58aa13566e',
+              'restored_blob':'7bcf46aa4c287105d32baaedd5d69d8af3b1bc83',
+              'runtime_test_performed':False,
+              'device_modified':False,
+          }, indent=2) + '\n')
+          print('R9.5 pinned historical Resources.addAssetPath + component mapping: PASS')
+          R95_RESOURCE_CONTRACT
+          git -C magisk diff -- "$path" > reports/R95_HISTORICAL_STUB_RESOURCES.diff
+          test -s reports/R95_HISTORICAL_STUB_RESOURCES.json
 
       - name: R6.4 - Eliminate verified duplicate legacy Java classes before R8
         shell: bash

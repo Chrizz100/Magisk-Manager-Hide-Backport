@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R8 - Android 13 Real UI Navigation
+name: Magisk Manager-Hide R8.1 - Verified Build Tools and Android 13 GUI
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   r4-build:
-    name: Rebuild proven R6.4, verify real Android 13 GUI and Settings navigation
+    name: Build pinned R6.4 with verified ONDK/Gradle and run R8 GUI navigation
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     steps:
@@ -1075,11 +1075,235 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Obtain official Magisk ONDK
+      - name: R8.1 - Restore cached official build archives
+        id: r81_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/magisk-r81-verified-tools
+          key: magisk-r81-ubuntu24-ondk-r30.1-a05e40a2-gradle9.7.1-acd53f1e-v1
+
+      - name: R8.1 - Verify official ONDK and Gradle archives (retries + SHA-256)
         shell: bash
         run: |
           set -euo pipefail
-          (cd magisk && python3 build.py -v ndk) 2>&1 | tee reports/ondk.log
+          cat > r81_prepare_tools.py <<'R81_PINNED_TOOLCHAIN_PY'
+          #!/usr/bin/env python3
+          """Pinned, SHA-verified source archives for isolated Magisk 31.1 CI builds.
+          
+          Does not modify the project's Magisk application or native sources. It only
+          installs the official ONDK under Android SDK and points the Gradle wrapper at
+          the verified official distribution, eliminating a second network fetch.
+          """
+          from __future__ import annotations
+          
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          import tarfile
+          import time
+          import urllib.request
+          from urllib.parse import urlparse
+          from dataclasses import dataclass
+          from typing import Callable
+          
+          @dataclass(frozen=True)
+          class PinnedArchive:
+              filename: str
+              size: int
+              sha256: str
+              urls: tuple[str, ...]
+          
+          # SHA-256 digests and byte counts are from the official GitHub release asset metadata.
+          ONDK = PinnedArchive(
+              filename='ondk-r30.1-linux.tar.xz',
+              size=396326124,
+              sha256='a05e40a2b44e57c3103dd09721d3c2fccd3211e35db1ff9818e6f2a44e210289',
+              urls=(
+                  'https://github.com/topjohnwu/ondk/releases/download/r30.1/ondk-r30.1-linux.tar.xz',
+                  'https://api.github.com/repos/topjohnwu/ondk/releases/assets/494403685',
+              ),
+          )
+          GRADLE = PinnedArchive(
+              filename='gradle-9.7.1-bin.zip',
+              size=151433392,
+              sha256='acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a',
+              urls=(
+                  'https://downloads.gradle.org/distributions/gradle-9.7.1-bin.zip',
+                  'https://api.github.com/repos/gradle/gradle-distributions/releases/assets/520945879',
+                  'https://github.com/gradle/gradle-distributions/releases/download/v9.7.1/gradle-9.7.1-bin.zip',
+              ),
+          )
+          
+          
+          def digest_file(path: Path) -> tuple[str, int]:
+              h = hashlib.sha256()
+              size = 0
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      size += len(chunk)
+                      h.update(chunk)
+              return h.hexdigest(), size
+          
+          
+          def verified(path: Path, source: PinnedArchive) -> bool:
+              if not path.is_file():
+                  return False
+              sha, size = digest_file(path)
+              return size == source.size and sha == source.sha256
+          
+          
+          def ensure_download(source: PinnedArchive, cache: Path, *, rounds: int = 3,
+                              sleeper: Callable[[float], None] = time.sleep) -> tuple[Path, str, int]:
+              """Use verified cache or bounded retries across official URLs; reject partial data."""
+              cache.mkdir(parents=True, exist_ok=True)
+              target = cache / source.filename
+              if verified(target, source):
+                  print(f'{source.filename}: cached archive verified SHA-256 ({source.size} bytes)', flush=True)
+                  return target, 'verified-cache', 0
+              if target.exists():
+                  print(f'{source.filename}: invalid cache rejected; removing', flush=True)
+                  target.unlink()
+          
+              failures: list[str] = []
+              count = 0
+              for cycle in range(rounds):
+                  for url in source.urls:
+                      count += 1
+                      temporary = cache / (source.filename + '.part')
+                      temporary.unlink(missing_ok=True)
+                      print(f'{source.filename}: attempt {count} via {urlparse(url).netloc}', flush=True)
+                      try:
+                          request = urllib.request.Request(
+                              url, headers={
+                                  'User-Agent': 'Magisk-R8.1-Verified-CI/1',
+                                  'Accept': 'application/octet-stream',
+                              },
+                          )
+                          hasher = hashlib.sha256()
+                          byte_count = 0
+                          with urllib.request.urlopen(request, timeout=180) as response, temporary.open('wb') as f:
+                              for chunk in iter(lambda: response.read(1024 * 1024), b''):
+                                  byte_count += len(chunk)
+                                  # Limit unexpectedly large downloads even if remote is incorrect.
+                                  if byte_count > source.size:
+                                      raise ValueError('archive exceeds official expected byte count')
+                                  hasher.update(chunk)
+                                  f.write(chunk)
+                          actual = hasher.hexdigest()
+                          if byte_count != source.size or actual != source.sha256:
+                              raise ValueError(f'archive integrity mismatch: size={byte_count}, sha256={actual}')
+                          temporary.replace(target)
+                          print(f'{source.filename}: integrity verified SHA-256; source attempt {count} accepted', flush=True)
+                          return target, url, count
+                      except Exception as error:
+                          temporary.unlink(missing_ok=True)
+                          msg = f'{type(error).__name__}: {error}'
+                          failures.append(f'attempt {count}: {msg}')
+                          print(f'{source.filename}: attempt {count} failed: {msg}', flush=True)
+                          if count < rounds * len(source.urls):
+                              sleeper(min(5 * count, 25))
+              raise RuntimeError(f'Cannot securely obtain {source.filename} after {count} attempts; '
+                                 + ' | '.join(failures[-4:]))
+          
+          
+          def install_ondk(archive: Path, sdk: Path) -> Path:
+              """Reproduce the pinned Magisk build.py setup_ndk layout, from a verified archive."""
+              parent = sdk / 'ndk'
+              original = parent / 'ondk-r30.1'
+              final = parent / 'magisk'
+              parent.mkdir(parents=True, exist_ok=True)
+              if original.exists() or original.is_symlink():
+                  shutil.rmtree(original) if original.is_dir() and not original.is_symlink() else original.unlink()
+              with tarfile.open(archive, 'r:xz') as tar:
+                  # Match the pinned Magisk build.py extraction filter (Python 3.13).
+                  tar.extractall(parent, filter='tar')
+              if not (original / 'ndk-build').is_file() or not (original / 'toolchains' / 'rust').is_dir():
+                  raise RuntimeError('Official ONDK archive did not produce its expected root layout')
+              if final.exists() or final.is_symlink():
+                  shutil.rmtree(final) if final.is_dir() and not final.is_symlink() else final.unlink()
+              original.rename(final)
+              assert (final / 'ndk-build').is_file()
+              assert (final / 'toolchains' / 'rust').is_dir()
+              print(f'Magisk native build tools verified at {final}', flush=True)
+              return final
+          
+          
+          def configure_gradle(archive: Path, wrapper_properties: Path) -> str:
+              """Use official SHA-matched local ZIP so Gradle wrapper won't hit GitHub redirects."""
+              original = r'distributionUrl=https\://services.gradle.org/distributions/gradle-9.7.1-bin.zip'
+              props = wrapper_properties.read_text()
+              if props.count(original) != 1:
+                  raise RuntimeError('Pinned Magisk 31.1 Gradle wrapper baseline mismatch')
+              if 'distributionSha256Sum=' in props:
+                  raise RuntimeError('Gradle wrapper integrity setting unexpectedly changed')
+              if not verified(archive, GRADLE):
+                  raise RuntimeError('Refusing to select unverified Gradle distribution')
+              # Java .properties requires a backslash before ':' in the URL scheme.
+              local = archive.resolve().as_uri()
+              escaped = local.replace(':', r'\:', 1)
+              props = props.replace(original, 'distributionUrl=' + escaped)
+              props = props.replace('networkTimeout=10000', 'networkTimeout=120000')
+              props = props.rstrip('\n') + '\n' + 'distributionSha256Sum=' + GRADLE.sha256 + '\n'
+              wrapper_properties.write_text(props)
+              assert ('distributionUrl=' + escaped) in props
+              print('Gradle 9.7.1 wrapper now uses verified local archive (no redirect)', flush=True)
+              return local
+          
+          
+          def run() -> None:
+              sdk_value = os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT')
+              if not sdk_value:
+                  sys.exit('Android SDK missing: ANDROID_HOME / ANDROID_SDK_ROOT not configured')
+              cache = Path.home() / '.cache' / 'magisk-r81-verified-tools'
+              out = Path('reports')
+              out.mkdir(parents=True, exist_ok=True)
+              info = {
+                  'base': 'Official Magisk 31.1 pinned 0972f67d97f9b6302b67c5171283330c74114b4a',
+                  'note': 'Only CI tool archives and Gradle wrapper URL; no Magisk feature modifications',
+                  'archives': {},
+                  'success': False,
+              }
+              try:
+                  ndk, ndk_source, ndk_tries = ensure_download(ONDK, cache)
+                  info['archives']['ondk'] = {'sha256': ONDK.sha256, 'bytes': ONDK.size,
+                                              'source': ndk_source, 'attempts': ndk_tries}
+                  zipfile, gradle_source, gradle_tries = ensure_download(GRADLE, cache)
+                  info['archives']['gradle'] = {'sha256': GRADLE.sha256, 'bytes': GRADLE.size,
+                                                 'source': gradle_source, 'attempts': gradle_tries}
+                  install_ondk(ndk, Path(sdk_value))
+                  wrapper = Path('magisk/app/gradle/wrapper/gradle-wrapper.properties')
+                  configure_gradle(zipfile, wrapper)
+                  info['success'] = True
+                  print('R8.1 official ONDK r30.1 and Gradle 9.7.1 integrity/installation: PASS', flush=True)
+              finally:
+                  (out / 'R8_1_TOOLCHAIN_STATUS.json').write_text(json.dumps(info, indent=2, sort_keys=True) + '\n')
+          
+          
+          if __name__ == '__main__':
+              run()
+          R81_PINNED_TOOLCHAIN_PY
+          python3 -m py_compile r81_prepare_tools.py
+          python3 r81_prepare_tools.py 2>&1 | tee reports/r8_1_tools.log
+          test -s reports/R8_1_TOOLCHAIN_STATUS.json
+          python3 - <<'R81_CHECK'
+          import json
+          from pathlib import Path
+          obj=json.loads(Path('reports/R8_1_TOOLCHAIN_STATUS.json').read_text())
+          assert obj['success'] is True
+          assert set(obj['archives'])=={'ondk','gradle'}
+          assert Path('magisk/app/gradle/wrapper/gradle-wrapper.properties').read_text().count('distributionSha256Sum=')==1
+          print('R8.1 official ONDK/Gradle toolchain ready: PASS')
+          R81_CHECK
+
+      - name: R8.1 - Save SHA-verified archives for subsequent runs
+        if: steps.r81_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/magisk-r81-verified-tools
+          key: magisk-r81-ubuntu24-ondk-r30.1-a05e40a2-gradle9.7.1-acd53f1e-v1
 
       - name: Generate throwaway R6 CI signing certificate (never distribute)
         shell: bash

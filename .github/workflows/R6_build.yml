@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R9.3 - Wait for Android services after root emulator restart
+name: Magisk Manager-Hide R9.4 - Regrant Android 13 permission after Magisk AVD setup
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -1799,7 +1799,7 @@ jobs:
           chmod 0700 r8_emulator_gui.sh
           echo 'R8 emulator GUI script and ABI compatibility: PASS'
 
-      - name: R9 - Verify and prepare strict official Magisk daemon + hide/restore harness
+      - name: R9.4 - Verify and prepare Magisk daemon + notification-permission recovery
         shell: bash
         run: |
           set -euo pipefail
@@ -2064,9 +2064,26 @@ jobs:
                   self.mark(stage)
 
               def enable_gui(self):
+                  # The official Magisk AVD setup reinstalls the research APK and restarts
+                  # Android. R8's earlier POST_NOTIFICATIONS grant is not necessarily
+                  # retained; in R9.3 the real permission-controller dialog blocked focus.
+                  # Never grant anything until the isolated rooted emulator is verified.
+                  required = ('AVD_ONLY', 'ADB_ROOT', 'MAGISK_DAEMON_31100',
+                              'ANDROID_FRAMEWORK_RESTORED')
+                  if not all(self.stages.get(stage) for stage in required):
+                      raise RuntimeError('R9 notification regrant requires verified rooted AVD and framework')
+                  self.adb('pm grant ' + ORIGINAL + ' android.permission.POST_NOTIFICATIONS',
+                           output='r94_notification_grant.txt')
                   self.adb('am force-stop ' + ORIGINAL)
                   self.adb('am start -W -n ' + ACTIVITY, timeout=50)
-                  time.sleep(5)
+                  try:
+                      self.wait(lambda: self._focus_is(ORIGINAL),
+                                'Magisk foreground after Android 13 notification permission grant', seconds=60)
+                  except RuntimeError:
+                      # Preserve what is actually covering the app, never fake a GUI_PASS.
+                      self.adb('dumpsys activity activities', check=False,
+                               output='r94_focus_failure_activities.txt')
+                      raise
                   self.focus(ORIGINAL)
                   xml = self.ui_dump('root_home')
                   if 'Hide the Magisk app' not in xml:

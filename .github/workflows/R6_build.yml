@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R8.1 - Verified Build Tools and Android 13 GUI
+name: Magisk Manager-Hide R9 - Official AVD Root and Manager Hide/Restore
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -11,9 +11,9 @@ permissions:
 
 jobs:
   r4-build:
-    name: Build pinned R6.4 with verified ONDK/Gradle and run R8 GUI navigation
+    name: Build pinned R6.4 then validate R8 GUI and R9 Magisk daemon hide/restore
     runs-on: ubuntu-24.04
-    timeout-minutes: 95
+    timeout-minutes: 115
     steps:
       - name: Fetch official pinned v31.1 and its historical sources
         uses: actions/checkout@v6
@@ -1582,6 +1582,337 @@ jobs:
           chmod 0700 r8_emulator_gui.sh
           echo 'R8 emulator GUI script and ABI compatibility: PASS'
 
+      - name: R9 - Verify and prepare strict official Magisk daemon + hide/restore harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports/r9_emulator
+          printf '%s\n' 'R9: official Magisk 31.1 AVD daemon only; temporary research signature; API33 x86_64 QEMU; no real phone.' > reports/r9_emulator/SCOPE.txt
+          test -s magisk/out/app-release.apk
+          test "$(git -C magisk rev-parse HEAD)" = 0972f67d97f9b6302b67c5171283330c74114b4a
+          test -f magisk/scripts/avd_setup.sh
+          grep -Fq 'def setup_avd():' magisk/build.py
+          cat > r9_root_emulator.py <<'PY_R9_SCRIPT'
+          #!/usr/bin/env python3
+          """R9: strict API-33 AVD-only Magisk daemon + manager hide/restore smoke.
+          
+          Research-only. Never run on a physical device. All changes take place on a
+          throwaway emulator using a freshly built research APK and temporary CI key.
+          """
+          import json
+          import os
+          import re
+          import shlex
+          import subprocess
+          import sys
+          import time
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          
+          ORIGINAL = 'com.topjohnwu.magisk'
+          ACTIVITY = ORIGINAL + '/.ui.MainActivity'
+          EXPECTED = {'ro.kernel.qemu': '1', 'ro.build.version.sdk': '33', 'ro.product.cpu.abi': 'x86_64'}
+          PACKAGE_RE = re.compile(r'[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+')
+          REQUIRED_STAGES = ('AVD_ONLY', 'ADB_ROOT', 'MAGISK_DAEMON_31100', 'MAGISK_SU',
+                             'HIDE_BUTTON', 'HIDE_DIALOG', 'STUB_INSTALLED', 'REQUESTER_BOUND',
+                             'STUB_FOREGROUND', 'STUB_RESTORE_BUTTON', 'RESTORE_DIALOG',
+                             'REQUESTER_CLEARED', 'ORIGINAL_FOREGROUND', 'MAGISK_SU_AFTER_RESTORE')
+          
+          
+          def extract_requester(output):
+              lines = [line.strip() for line in output.splitlines() if line.startswith('value=')]
+              if not lines:
+                  return ''
+              if len(lines) != 1:
+                  raise RuntimeError('Unexpected multiple requester DB values')
+              value = lines[0][6:]
+              if value and (not PACKAGE_RE.fullmatch(value) or value == ORIGINAL):
+                  raise RuntimeError('Malformed requester DB value')
+              return value
+          
+          
+          def find_node(xml_text, label):
+              root = ET.fromstring(xml_text)
+              for node in root.iter('node'):
+                  if label not in (node.get('text', ''), node.get('content-desc', '')):
+                      continue
+                  match = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.get('bounds', ''))
+                  if not match:
+                      continue
+                  x0, y0, x1, y1 = map(int, match.groups())
+                  if x1 > x0 and y1 > y0:
+                      return ((x0 + x1) // 2, (y0 + y1) // 2)
+              raise RuntimeError('UI element not found: ' + label)
+          
+          
+          def test_pure():
+              x = '<hierarchy><node text="Hide the Magisk app" bounds="[12,20][52,80]" /></hierarchy>'
+              assert find_node(x, 'Hide the Magisk app') == (32, 50)
+              for bad in ('random', 'com.topjohnwu.magisk', 'foo.bar;rm', 'UPPER.pkg'):
+                  try:
+                      extract_requester('value=' + bad)
+                  except RuntimeError:
+                      pass
+                  else:
+                      raise AssertionError('Invalid requester accepted: ' + bad)
+              assert extract_requester('') == ''
+              assert extract_requester('value=abc.def\n') == 'abc.def'
+              assert len(REQUIRED_STAGES) == len(set(REQUIRED_STAGES))
+              print('R9_SELFTEST_PASS: XML bounds, DB validation, unique strict gates')
+          
+          
+          class R9:
+              def __init__(self):
+                  self.workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+                  self.report = self.workspace / 'reports' / 'r9_emulator'
+                  self.report.mkdir(parents=True, exist_ok=True)
+                  self.apk = self.workspace / 'magisk' / 'out' / 'app-release.apk'
+                  self.stages = {}
+                  self.target = None
+                  self.original_present = False
+                  self.error = None
+                  self.root_setup_started = False
+                  self.restored_by_ui = False
+          
+              def cmd(self, argv, *, timeout=45, check=True, output=None, cwd=None):
+                  try:
+                      p = subprocess.run(argv, cwd=cwd, text=True, errors='replace',
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         timeout=timeout)
+                      if output:
+                          (self.report / output).write_text(p.stdout)
+                      if check and p.returncode:
+                          raise RuntimeError(f'Command failed ({p.returncode}): {argv[:3]}: {p.stdout[-700:]}')
+                      return p.stdout.strip()
+                  except subprocess.TimeoutExpired as e:
+                      raise RuntimeError('Timed out: ' + str(argv[:3])) from e
+          
+              def adb(self, remote, *, timeout=45, check=True, output=None):
+                  return self.cmd(['adb', 'shell', remote], timeout=timeout, check=check, output=output)
+          
+              def mark(self, stage):
+                  self.stages[stage] = True
+                  print('R9_PASS:', stage, flush=True)
+          
+              def identity(self):
+                  devices = [line.split()[0] for line in self.cmd(['adb', 'devices']).splitlines()[1:]
+                             if line.strip() and line.split()[-1] == 'device']
+                  if len(devices) != 1 or not devices[0].startswith('emulator-'):
+                      raise RuntimeError('Strict R9 gate: exactly one AVD emulator required')
+                  info = {key: self.adb('getprop ' + key).strip() for key in EXPECTED}
+                  info['adb_serial'] = devices[0]
+                  (self.report / 'device.json').write_text(json.dumps(info, indent=2) + '\n')
+                  if any(info.get(key) != expected for key, expected in EXPECTED.items()):
+                      raise RuntimeError('Strict R9 gate: wrong device: ' + str(info))
+                  self.mark('AVD_ONLY')
+          
+              def requester(self):
+                  sql = 'SELECT value FROM settings WHERE key="requester" LIMIT 1'
+                  remote = '/data/adb/magisk/magisk --sqlite ' + shlex.quote(sql)
+                  return extract_requester(self.adb(remote))
+          
+              def sqlite_clear_requester(self):
+                  sql = 'DELETE FROM settings WHERE key="requester"'
+                  return self.adb('/data/adb/magisk/magisk --sqlite ' + shlex.quote(sql), check=False)
+          
+              def ui_dump(self, label):
+                  dest = self.report / (label + '.xml')
+                  remote = '/sdcard/r9_' + label + '.xml'
+                  for attempt in range(1, 4):
+                      try:
+                          self.adb('uiautomator dump ' + shlex.quote(remote), timeout=55)
+                          self.cmd(['adb', 'pull', remote, str(dest)], timeout=25)
+                          root = ET.parse(dest).getroot()
+                          assert root.tag == 'hierarchy' and len(list(root.iter('node'))) > 0
+                          return dest.read_text()
+                      except (RuntimeError, ET.ParseError, AssertionError):
+                          if attempt == 3:
+                              raise
+                          time.sleep(2)
+                  raise RuntimeError('unreachable')
+          
+              def tap(self, xml, text):
+                  x, y = find_node(xml, text)
+                  self.adb(f'input tap {x} {y}')
+                  time.sleep(2)
+          
+              def focus(self, expected):
+                  data = self.adb('dumpsys activity activities', output='activity_' + expected.replace('.', '_') + '.txt')
+                  matches = re.findall(r'topResumedActivity\s*=\s*ActivityRecord\{[^\n]*', data)
+                  if not matches or not any((expected + '/') in s for s in matches):
+                      raise RuntimeError('Expected top-resumed package is absent: ' + expected)
+          
+              def wait(self, action, description, seconds=75):
+                  deadline = time.monotonic() + seconds
+                  last = None
+                  while time.monotonic() < deadline:
+                      try:
+                          value = action()
+                          if value:
+                              return value
+                      except RuntimeError as e:
+                          last = e
+                      time.sleep(3)
+                  raise RuntimeError('Timed out waiting for ' + description + (' (' + str(last) + ')' if last else ''))
+          
+              def root_setup(self):
+                  self.identity()  # BEFORE any privilege escalation or installation
+                  if not self.apk.is_file() or self.apk.stat().st_size < 1_000_000:
+                      raise RuntimeError('Pinned research APK is missing')
+                  if self.requester_or_unavailable():
+                      raise RuntimeError('Emulator already has an unexpected Magisk manager binding')
+                  self.original_present = 'package:' in self.adb('pm path ' + ORIGINAL)
+                  if not self.original_present:
+                      raise RuntimeError('R8 research manager is not installed')
+                  self.cmd(['adb', 'root'], timeout=35, output='adb_root.txt')
+                  self.cmd(['adb', 'wait-for-device'], timeout=60)
+                  if self.adb('id -u') != '0':
+                      raise RuntimeError('ADB root did not activate on this official AVD')
+                  self.mark('ADB_ROOT')
+                  # Official pinned Magisk script (no third-party emulation root helper).
+                  self.root_setup_started = True
+                  self.cmd(['python3', 'build.py', 'emulator', str(self.apk)], timeout=240,
+                           cwd=self.workspace / 'magisk', output='official_avd_setup.txt')
+                  self.cmd(['adb', 'wait-for-device'], timeout=60)
+                  version = self.adb('/data/adb/magisk/magisk -V')
+                  if version != '31100':
+                      raise RuntimeError('Unexpected Magisk daemon version code: ' + version)
+                  self.mark('MAGISK_DAEMON_31100')
+                  self.ensure_su('MAGISK_SU')
+          
+              def requester_or_unavailable(self):
+                  # Before activating the daemon its database might not exist.
+                  return self.adb('test -f /data/adb/magisk.db && echo present || true') == 'present'
+          
+              def ensure_su(self, stage):
+                  result = self.adb('/debug_ramdisk/su -c id', timeout=40)
+                  if 'uid=0(' not in result:
+                      raise RuntimeError('Magisk SU did not grant uid=0: ' + result)
+                  self.mark(stage)
+          
+              def enable_gui(self):
+                  self.adb('am force-stop ' + ORIGINAL)
+                  self.adb('am start -W -n ' + ACTIVITY, timeout=50)
+                  time.sleep(5)
+                  self.focus(ORIGINAL)
+                  xml = self.ui_dump('root_home')
+                  if 'Hide the Magisk app' not in xml:
+                      raise RuntimeError('Root manager-hiding button is not displayed in active Magisk UI')
+                  self.mark('HIDE_BUTTON')
+                  self.tap(xml, 'Hide the Magisk app')
+                  dialog = self.ui_dump('hide_dialog')
+                  find_node(dialog, 'New name')
+                  find_node(dialog, 'OK')
+                  self.mark('HIDE_DIALOG')
+                  self.tap(dialog, 'OK')
+          
+              def hide_verify(self):
+                  target = self.wait(self.requester, 'new requester DB binding')
+                  self.target = target
+                  if 'package:' not in self.adb('pm path ' + shlex.quote(target)):
+                      raise RuntimeError('Repackaged manager is not installed: ' + target)
+                  self.mark('STUB_INSTALLED')
+                  if self.requester() != target:
+                      raise RuntimeError('Native requester package binding changed unexpectedly')
+                  self.mark('REQUESTER_BOUND')
+                  self.wait(lambda: self._focus_is(target), 'migrated app foreground')
+                  self.focus(target)
+                  self.mark('STUB_FOREGROUND')
+                  xml = self.ui_dump('stub_home')
+                  find_node(xml, 'Restore the Magisk app')
+                  self.mark('STUB_RESTORE_BUTTON')
+                  self.tap(xml, 'Restore the Magisk app')
+                  dialog = self.ui_dump('restore_dialog')
+                  find_node(dialog, 'Restore the hidden manager to its original package?')
+                  find_node(dialog, 'OK')
+                  self.mark('RESTORE_DIALOG')
+                  self.tap(dialog, 'OK')
+          
+              def _focus_is(self, package):
+                  data = self.adb('dumpsys activity activities')
+                  return any(package + '/' in m for m in re.findall(r'topResumedActivity\s*=\s*ActivityRecord\{[^\n]*', data))
+          
+              def restore_verify(self):
+                  self.wait(lambda: self.requester() == '', 'cleared Magisk requester binding')
+                  self.mark('REQUESTER_CLEARED')
+                  self.wait(lambda: self._focus_is(ORIGINAL), 'original Magisk manager foreground')
+                  self.focus(ORIGINAL)
+                  xml = self.ui_dump('restored_home')
+                  if 'Home' not in xml or 'Magisk' not in xml:
+                      raise RuntimeError('Restored Magisk home is missing UI labels')
+                  self.mark('ORIGINAL_FOREGROUND')
+                  self.ensure_su('MAGISK_SU_AFTER_RESTORE')
+                  self.restored_by_ui = True
+          
+              def cleanup(self):
+                  if not self.stages.get('AVD_ONLY'):
+                      return
+                  # Never confuse manual recovery with a successful feature restore.
+                  if self.root_setup_started and self.original_present:
+                      try:
+                          if self.requester():
+                              self.sqlite_clear_requester()
+                              (self.report / 'manual_rollback.txt').write_text('Native requester DB cleared after incomplete UI restoration.\n')
+                      except Exception as e:
+                          (self.report / 'manual_rollback_error.txt').write_text(str(e) + '\n')
+                      if self.target and PACKAGE_RE.fullmatch(self.target):
+                          try:
+                              self.cmd(['adb', 'uninstall', self.target], timeout=55, check=False,
+                                       output='emulator_stub_cleanup.txt')
+                          except Exception as e:
+                              (self.report / 'stub_cleanup_error.txt').write_text(str(e) + '\n')
+          
+              def finish(self):
+                  if self.stages.get('AVD_ONLY'):
+                      try:
+                          self.adb('logcat -d -v threadtime', timeout=90, output='logcat.txt')
+                          self.adb('dumpsys activity activities', output='final_activities.txt')
+                      except Exception as e:
+                          (self.report / 'log_collection_error.txt').write_text(str(e))
+                  ok = self.error is None and all(self.stages.get(x) for x in REQUIRED_STAGES)
+                  outcome = {
+                      'base': 'pinned Magisk 31.1, R6.4 source bridge, R8.1 verified toolchain',
+                      'test': 'official Magisk AVD daemon + real Android 13 manager hide and restore',
+                      'checks': self.stages, 'missing_checks': [s for s in REQUIRED_STAGES if s not in self.stages],
+                      'root_permissions_tested': bool(self.stages.get('MAGISK_SU')),
+                      'hide_and_restore_tested': bool(self.restored_by_ui),
+                      'physical_device_modified': False, 'target': self.target,
+                      'error': self.error,
+                      'result': 'ROOT_HIDE_RESTORE_PASS' if ok else 'ROOT_HIDE_RESTORE_FAILED_OR_INCOMPLETE',
+                  }
+                  (self.report / 'R9_RESULT.json').write_text(json.dumps(outcome, indent=2) + '\n')
+                  print('R9 actual root and hide/restore outcome:', outcome['result'], flush=True)
+                  if self.error:
+                      print('R9 FAILED STAGE:', self.error, file=sys.stderr, flush=True)
+                  return 0 if ok else 1
+          
+              def run(self):
+                  try:
+                      self.root_setup()
+                      self.enable_gui()
+                      self.hide_verify()
+                      self.restore_verify()
+                  except Exception as e:
+                      self.error = str(e)
+                  finally:
+                      self.cleanup()
+                      return self.finish()
+          
+          
+          if __name__ == '__main__':
+              if len(sys.argv) == 2 and sys.argv[1] == '--selftest':
+                  test_pure()
+              elif len(sys.argv) == 1:
+                  if not os.environ.get('GITHUB_WORKSPACE'):
+                      sys.exit('R9 only supports the isolated GitHub Actions emulator runner')
+                  sys.exit(R9().run())
+              else:
+                  sys.exit('Usage: r9_root_emulator.py [--selftest]')
+          PY_R9_SCRIPT
+          python3 -m py_compile r9_root_emulator.py
+          python3 r9_root_emulator.py --selftest | tee reports/r9_emulator/preflight.txt
+          echo 'R9 root test harness is ready; actual Magisk service has not yet been started.'
+
       - name: R8 - Enable hardware virtualization on GitHub Linux
         shell: bash
         run: |
@@ -1604,7 +1935,7 @@ jobs:
           ram-size: 3072M
           emulator-boot-timeout: 900
           emulator-options: -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -camera-back none
-          script: bash r8_emulator_gui.sh
+          script: bash r8_emulator_gui.sh && python3 r9_root_emulator.py
 
       - name: R8 - Verify actual UI outcome and untested root scope
         if: always()
@@ -1630,11 +1961,34 @@ jobs:
               raise SystemExit('R8 emulator has not produced a real GUI result; see logs')
           R8_STATUS
 
+      - name: R9 - Verify real Root + Hide + Restore (never infer from R8 success)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports/r9_emulator
+          if [ ! -f reports/r9_emulator/R9_RESULT.json ]; then
+            echo 'R9_NOT_EXECUTED: root or emulator setup never finished' > reports/r9_emulator/R9_NOT_EXECUTED.txt
+          fi
+          python3 - <<'PY_R9_RESULT'
+          import json
+          from pathlib import Path
+          p=Path('reports/r9_emulator/R9_RESULT.json')
+          if not p.is_file():
+              raise SystemExit('R9 root/hide/restore test was not executed')
+          result=json.loads(p.read_text())
+          assert result['physical_device_modified'] is False
+          assert result['root_permissions_tested'] is True
+          assert result['hide_and_restore_tested'] is True
+          assert result['result']=='ROOT_HIDE_RESTORE_PASS', result.get('error') or result.get('missing_checks')
+          print('R9 confirmed full manager hide+restore with real Magisk service')
+          PY_R9_RESULT
+
       - name: Upload compiler and source evidence only (no APK, no signing key)
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: R8_ANDROID13_GUI_NAVIGATION_EVIDENCE_NO_APK
+          name: R9_ANDROID13_REAL_ROOT_HIDE_RESTORE_EVIDENCE_NO_APK
           path: reports/
           if-no-files-found: error
           retention-days: 14

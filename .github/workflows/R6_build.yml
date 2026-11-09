@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R9.5 - Restore pinned historical Stub APK resources
+name: Magisk Manager-Hide R9.6 - Restore original RootUtils constructor and verify hidden UI
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -978,6 +978,75 @@ jobs:
           git -C magisk diff -- "$path" > reports/R95_HISTORICAL_STUB_RESOURCES.diff
           test -s reports/R95_HISTORICAL_STUB_RESOURCES.json
 
+      - name: R9.6 - Restore byte-exact historical RootUtils stub service constructor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_R96_RESTORE'
+          import hashlib
+          import json
+          import subprocess
+          from pathlib import Path
+
+          repo = Path('magisk')
+          source = '0972f67d97f9b6302b67c5171283330c74114b4a'
+          old = 'ea16c8141eb64dc28b56a0e7fb536689ef465429'
+          path = 'app/core/src/main/java/com/topjohnwu/magisk/core/utils/RootUtils.kt'
+          pinned_blob = '081df599a675aea08a152dc20c132627cee0b6df'
+          legacy_blob = '322e5656c014168ae7c2ceed7c9832198593395f'
+          def git(*args):
+              return subprocess.check_output(['git','-C',str(repo),*args],text=True).strip()
+          assert git('rev-parse','HEAD') == source, 'Source commit mismatch'
+          assert git('hash-object',path) == pinned_blob, 'RootUtils source drift; refusing change'
+          actual = (repo/path).read_text()
+          historical = subprocess.check_output(['git','-C',str(repo),'show',f'{old}:{path}'],text=True)
+          assert git('rev-parse','--verify',old)
+          assert len(actual) == 5335 and len(historical) == 5450, 'Unexpected original source sizes'
+          def replace_once(s,old,new):
+              count=s.count(old)
+              assert count == 1, f'Expected one exact patch anchor, got {count}: {old[:90]!r}'
+              return s.replace(old,new,1)
+          fixed = replace_once(actual,
+              'class RootUtils : RootService() {\n\n    private lateinit var am: ActivityManager\n',
+              'class RootUtils(stub: Any?) : RootService() {\n\n'
+              '    private val className: String = stub?.javaClass?.name ?: javaClass.name\n'
+              '    private lateinit var am: ActivityManager\n\n'
+              '    constructor() : this(null)\n')
+          fixed = replace_once(fixed,
+              'return ComponentName(packageName, javaClass.name)',
+              'return ComponentName(packageName, className)')
+          assert fixed == historical, 'Result is NOT byte-exact original historical RootUtils.kt'
+          (repo/path).write_text(fixed)
+          assert git('hash-object',path) == legacy_blob, 'Historic blob SHA mismatch'
+
+          proguard_path = repo/'app/core/proguard-rules.pro'
+          rules = proguard_path.read_text()
+          before = '-keep class com.topjohnwu.magisk.core.App { <init>(java.lang.Object); }\n'
+          new_rule = '-keep class com.topjohnwu.magisk.core.utils.RootUtils { <init>(java.lang.Object); }\n'
+          assert new_rule not in rules, 'RootUtils reflection rule already exists; stop'
+          rules = replace_once(rules, before, before + new_rule)
+          proguard_path.write_text(rules)
+          assert new_rule in proguard_path.read_text(), 'Reflection preservation rule absent'
+          assert git('diff','--check') == '', 'Source whitespace error'
+
+          report={
+              'stage':'R9.6 historical RootUtils real constructor',
+              'original_commit':source,
+              'historic_commit':old,
+              'rootutils_before_blob':pinned_blob,
+              'rootutils_after_blob':legacy_blob,
+              'rootutils_exact_historic_match':True,
+              'special_root_service_constructor':'RootUtils(java.lang.Object)',
+              'kept_by_R8':True,
+              'root_service_runtime_tested':False,
+              'real_device_modified':False,
+          }
+          Path('reports/R96_ROOTUTILS_CONSTRUCTOR.json').write_text(json.dumps(report,indent=2)+'\n')
+          print('R9.6 exact historical RootUtils constructor and R8 keep rule: PASS')
+          PY_R96_RESTORE
+          git -C magisk diff -- app/core/src/main/java/com/topjohnwu/magisk/core/utils/RootUtils.kt app/core/proguard-rules.pro > reports/R96_ROOTUTILS_ONLY.diff
+          test -s reports/R96_ROOTUTILS_CONSTRUCTOR.json
+
       - name: R6.4 - Eliminate verified duplicate legacy Java classes before R8
         shell: bash
         run: |
@@ -1843,7 +1912,7 @@ jobs:
           chmod 0700 r8_emulator_gui.sh
           echo 'R8 emulator GUI script and ABI compatibility: PASS'
 
-      - name: R9.4 - Verify and prepare Magisk daemon + notification-permission recovery
+      - name: R9.6 - Validate historical root service and capture hidden GUI readiness
         shell: bash
         run: |
           set -euo pipefail
@@ -2140,6 +2209,41 @@ jobs:
                   self.mark('HIDE_DIALOG')
                   self.tap(dialog, 'OK')
 
+              def wait_stub_restore_ui(self):
+                  """Do not mistake a blank first Compose frame for a working hidden manager.
+
+                  Capture repeated real UI hierarchy snapshots; never synthesize the button.
+                  The title only counts if Android actually exposes a tappable node.
+                  """
+                  label = 'Restore the Magisk app'
+                  attempts=[]
+                  for index in range(1, 7):
+                      xml = self.ui_dump(f'stub_probe_{index:02d}')
+                      (self.report / 'stub_home.xml').write_text(xml)
+                      root = ET.fromstring(xml)
+                      labels = sorted(set(t for node in root.iter('node')
+                                          for t in (node.get('text', ''),node.get('content-desc', ''))
+                                          if t))
+                      probe={'index':index, 'total_nodes':len(list(root.iter('node'))),
+                             'visible_labels':labels[:35], 'has_restore_button':False}
+                      try:
+                          find_node(xml, label)
+                          probe['has_restore_button']=True
+                          attempts.append(probe)
+                          (self.report/'R96_STUB_UI_READINESS.json').write_text(json.dumps(attempts,indent=2)+'\n')
+                          return xml
+                      except RuntimeError:
+                          attempts.append(probe)
+                          (self.report/'R96_STUB_UI_READINESS.json').write_text(json.dumps(attempts,indent=2)+'\n')
+                          if index < 6:
+                              time.sleep(5)
+                  # Preserve diagnostics before the unconditional emulator cleanup.
+                  self.adb('dumpsys activity activities',output='r96_blank_ui_activities.txt',check=False)
+                  self.adb('logcat -d -v threadtime',timeout=95,output='r96_blank_ui_logcat.txt',check=False)
+                  self.adb('screencap -p /sdcard/r96_blank_ui.png',check=False)
+                  self.cmd(['adb','pull','/sdcard/r96_blank_ui.png',str(self.report/'r96_blank_ui.png')],check=False)
+                  raise RuntimeError('R9.6: hidden manager has no Restore UI after six real snapshots; see R96_STUB_UI_READINESS.json and Android diagnostics')
+
               def hide_verify(self):
                   target = self.wait(self.requester, 'new requester DB binding')
                   self.target = target
@@ -2152,7 +2256,7 @@ jobs:
                   self.wait(lambda: self._focus_is(target), 'migrated app foreground')
                   self.focus(target)
                   self.mark('STUB_FOREGROUND')
-                  xml = self.ui_dump('stub_home')
+                  xml = self.wait_stub_restore_ui()
                   find_node(xml, 'Restore the Magisk app')
                   self.mark('STUB_RESTORE_BUTTON')
                   self.tap(xml, 'Restore the Magisk app')

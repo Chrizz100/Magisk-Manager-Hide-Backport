@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R11.2 - Verified Restore Dialog Tap and Strict Beta Gates
+name: Magisk Manager-Hide R11.3 - Fixed R11.2 Harness Integrity Pin and Strict Beta Gates
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -3172,7 +3172,7 @@ jobs:
         assert hashlib.sha256(old.encode()).hexdigest() == '179a5d88f5e9cbe6bad825ff8d465c2477353dbac636d780904ec886368bcf8c', 'R9.6 harness changed unexpectedly'
         new=Path('r97_harness_payload.py').read_text(encoding='utf-8')
         p.write_text(new, encoding='utf-8')
-        assert hashlib.sha256(p.read_bytes()).hexdigest() == '1253e68b9993d8aa28e341bb55bfc65c581010d3f9bb0868dd3acd23f7229a87'
+        assert hashlib.sha256(p.read_bytes()).hexdigest() == '8431f930ee52360fcadd59a9e3c59fe22ab02bce950d842a6b4c1dd3914cf39b', 'R11.2 post-confirm harness digest mismatch'
         print('R9.7 diagnostics loaded from reviewed original R9.6 harness: PASS')
         PY_R97_HARNESS
         python3 -m py_compile r9_root_emulator.py

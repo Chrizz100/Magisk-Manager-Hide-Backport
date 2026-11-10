@@ -1,4 +1,4 @@
-name: Magisk Manager-Hide R11.4.2 - Beta UI Gate Corrected Against Real AVD XML
+name: Magisk Manager-Hide R11.4.3 - Root Probe First, SystemUI ANR Classified, No Phone Beta
 
 # Research-only. Pins Magisk 31.1 plus R4 patches and restores the historic stub APK.
 # Reconstructs R3-R5, integrates the R6 migration UI and compiles it without device installation.
@@ -6154,9 +6154,21 @@ jobs:
         import sys,xml.etree.ElementTree as E
         r=E.parse(sys.argv[1]).getroot()
         labels=[v for el in r.iter() for field in ('text','content-desc') if (v:=el.get(field))]
-        assert 'Home' in labels and 'R11 Funktions-Beta – Root und Module' in labels and 'Magisk und Root abfragen' in labels
+        if any('System UI isn' in v and 'responding' in v for v in labels):
+            print('ENVIRONMENT_SYSTEMUI_ANR: Android SystemUI not responding', file=sys.stderr)
+            sys.exit(42)
+        if all(x in labels for x in ('Home','R11 Funktions-Beta – Root und Module','Magisk und Root abfragen')):
+            sys.exit(0)
+        print('R11 UI gate did not find beta Home elements: '+str(labels[:35]), file=sys.stderr)
+        sys.exit(1)
         PYXML
-              then found=1; break; fi
+              then found=1; break
+              else
+                state="$?"
+                if [[ "$state" -eq 42 ]]; then
+                  fail "ENVIRONMENT_SYSTEMUI_ANR: system interface blocked ${name}; beta NOT validated"
+                fi
+              fi
             fi
             sleep 3
           done
@@ -6172,7 +6184,39 @@ jobs:
         assert any('R11 Funktions-Beta' in t for t in texts), 'Actual prerelease status card is missing'
         print('R10.0 prerelease card and explicit root probe button visible')
         PY_R100_BUTTON
-        adb shell input tap 900 2236
+        # R11.4.3: Root tests must run before the optional navigation roundtrip.
+        # The independent r11_beta_root_avd.sh fail-closes if Magisk daemon, policy,
+        # root button or UID=0 are missing. It only targets disposable QEMU.
+        bash r11_beta_root_avd.sh
+        test -s "$GITHUB_WORKSPACE/reports/r11_beta_root/RESULT.json" || fail 'R11 root evidence missing'
+        # The Magisk AVD bootstrap may reboot Android. Recheck the ACTUAL beta Home.
+        adb shell am start -W -n "$PKG/com.topjohnwu.magisk.ui.MainActivity" >"$REP/post_root_launch.txt" 2>&1 || fail 'Beta relaunch after Magisk AVD failed'
+        get_ui post_root_home
+        # Never trust fixed coordinates for navigation after device/root setup.
+        tap_nav() {
+          local xmlfile="$1" label="$2" xy
+          xy="$(python3 - "$xmlfile" "$label" <<'PY_NAV'
+        import re,sys,xml.etree.ElementTree as ET
+        root=ET.parse(sys.argv[1]).getroot()
+        label=sys.argv[2]
+        found=[]
+        for el in root.iter('node'):
+            if el.get('text','') != label and el.get('content-desc','') != label:
+                continue
+            b=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',el.get('bounds',''))
+            if not b:continue
+            x0,y0,x1,y1=map(int,b.groups())
+            if x1 <= x0 or y1 <= y0:continue
+            if y0 < 1900:continue # Require bottom navigation; not the page title.
+            found.append(((x0+x1)//2,(y0+y1)//2))
+        if len(found)!=1:
+            sys.exit(f'Expected exactly one bottom-nav {label}: {found!r}')
+        print(*found[0])
+        PY_NAV
+        )" || fail "R11 ${label} navigation target ambiguous"
+          adb shell input tap $xy || fail "R11 ${label} navigation tap failed"
+        }
+        tap_nav "$REP/post_root_home.xml" 'Settings'
         sleep 3
         # The Settings page is present in the genuine app; no root functions called.
         for attempt in 1 2 3 4 5; do
@@ -6188,7 +6232,7 @@ jobs:
           [[ "$attempt" -lt 5 ]] || fail 'Settings screen failed to load'
           sleep 3
         done
-        adb shell input tap 180 2236
+        tap_nav "$REP/settings.xml" 'Home'
         sleep 2
         get_ui returned_home
         adb logcat -d -v brief > "$REP/logcat.txt" 2>&1 || true
@@ -6198,8 +6242,12 @@ jobs:
         import json, sys
         p=Path(sys.argv[1]);home=ET.parse(p/'returned_home.xml').getroot()
         labels={v for n in home.iter() for f in ('text','content-desc') if (v:=n.get(f))}
-        assert {'Magisk','Home'}<=labels
-        # Never claim root compatibility or app concealment from this smoke test.
+        assert {'Home','R11 Funktions-Beta – Root und Module','Magisk und Root abfragen'}<=labels
+        # A real SystemUI ANR must fail rather than count as a Home pass.
+        assert not any('System UI isn' in x and 'responding' in x for x in labels)
+        # The root probe was verified separately before the roundtrip.
+        assert (p.parent/'r11_beta_root'/'RESULT.json').exists(), 'R11 root validation absent'
+        # Never claim Alpha or real-device compatibility from these AVD tests.
         d={'result':'GUARDED_PRERELEASE_UI_PASS','package':'org.chrizz100.magiskhide.beta',
            'api':33,'install_without_replace':True,'home':True,'settings':True,
            'root_access_tested':False,'root_diagnostic_button_visible':True,'manager_hide_tested':False,'alpha_31100_compatibility_tested':False,
@@ -6327,7 +6375,7 @@ jobs:
         ram-size: 3072M
         emulator-boot-timeout: 900
         emulator-options: -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -camera-back none
-        script: bash r100_ui_smoke.sh && bash r11_beta_root_avd.sh
+        script: bash r100_ui_smoke.sh
 
     - name: R10.0 - Gate prerelease on actual AVD result, package and blocked writers
       if: ${{ steps.r100_avd.outcome == 'success' }}
@@ -6362,8 +6410,8 @@ jobs:
         assert a['alpha_31100_tested'] is False
         print('R11 beta root AVD verification PASS (Alpha device compatibility remains untested)')
         PY_R11_ROOT_GATE
-    - name: R11 - Upload non-final functional Beta candidate only after verified rooted AVD
-      if: ${{ steps.r100_avd.outcome == 'success' }}
+    - name: 'R11 - HOLD: no phone APK until beta Hide/Restore and module UI E2E pass'
+      if: ${{ false }}
       uses: actions/upload-artifact@v7
       with:
         name: R11_BETA_CANDIDATE_AVD_VERIFIED_NO_ALPHA_CLAIM

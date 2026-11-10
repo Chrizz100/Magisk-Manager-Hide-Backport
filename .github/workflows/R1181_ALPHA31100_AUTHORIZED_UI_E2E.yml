@@ -1,0 +1,501 @@
+name: Magisk R11.8.1 - Alpha 31100 AVD-only actual research SU authorization and E2E
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  alpha31100-compatibility:
+    name: R11.8.1 isolated Alpha SU permission + actual Root/Modules/Hide/Restore
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+    - name: Fetch exact upstream source for official Android emulator helper
+      uses: actions/checkout@v6
+      with:
+        repository: topjohnwu/Magisk
+        ref: 0972f67d97f9b6302b67c5171283330c74114b4a
+        path: magisk
+        persist-credentials: false
+        fetch-depth: 1
+    - name: Restore actual green R11.6.1 research APK without recompiling or re-signing
+      uses: actions/download-artifact@v8
+      with:
+        artifact-ids: '13757443773'
+        run-id: 42803784395
+        github-token: ${{ github.token }}
+        repository: Chrizz100/Magisk-Manager-Hide-Backport
+        path: alpha
+    - name: Pin both original APKs (SHA-256, contents and ABI) - no flashing
+      shell: bash
+      run: "set -euo pipefail\nmkdir -p alpha reports/r118 magisk/out\nAPK='alpha/R116_RESEARCH_AVD_ONLY_NOT_FOR_PHONE.apk'\n\
+        test -s \"$APK\"\necho '6dc479f4cb954ccaef2930b855338ebd76d4e37346c85f26a8c91e3d8160e5b0  '\"$APK\" | sha256sum -c
+        -\ncp \"$APK\" magisk/out/app-release.apk\ncurl -fL --retry 5 --retry-delay 4 --retry-all-errors --connect-timeout
+        25 --max-time 300 \\\n    https://github.com/vvb2060/Magisk/releases/download/31100/app-release.apk \\\n    -o alpha_31100.apk\n\
+        echo 'fb613e30f4889d03a88c7352a23a520f94753ed75c3e2b36498e074424691a24  alpha_31100.apk' | sha256sum -c -\npython3
+        - <<'PY_CHECK_APKS'\nfrom zipfile import ZipFile\nfrom pathlib import Path\nfor file in ('magisk/out/app-release.apk','alpha_31100.apk'):\n\
+        \ with ZipFile(file) as z:\n  assert z.testzip() is None, (file,'invalid ZIP')\n  for name in ('AndroidManifest.xml','classes.dex','lib/x86_64/libmagisk.so','assets/boot_patch.sh'):\n\
+        \   assert name in z.namelist(),(file,'missing',name)\n print(file,'actual signed Android APK and native x86_64 Magisk
+        verified')\nPY_CHECK_APKS\n"
+    - name: R11.8.1 - Pin original Alpha harness and provision research app SU only on verified QEMU
+      shell: bash
+      run: "set -euo pipefail\nmkdir -p reports/r9_emulator\ncat > r118_alpha31100.py <<'PY_R118_STRICT_ALPHA'\n#!/usr/bin/env
+        python3\n\"\"\"R9: strict API-33 AVD-only Magisk daemon + manager hide/restore smoke.\n\nResearch-only. Never run
+        on a physical device. All changes take place on a\nthrowaway emulator using a freshly built research APK and temporary
+        CI key.\n\"\"\"\nimport json\nimport os\nimport re\nimport shlex\nimport subprocess\nimport sys\nimport time\nimport
+        xml.etree.ElementTree as ET\nfrom pathlib import Path\n\nORIGINAL = 'com.topjohnwu.magisk'\nACTIVITY = ORIGINAL +
+        '/.ui.MainActivity'\nEXPECTED = {'ro.kernel.qemu': '1', 'ro.build.version.sdk': '33', 'ro.product.cpu.abi': 'x86_64'}\n\
+        PACKAGE_RE = re.compile(r'[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+')\nREQUIRED_STAGES = ('AVD_ONLY', 'ADB_ROOT', 'ALPHA_DAEMON_31100',
+        'ALPHA_RESEARCH_COEXISTENCE',\n                   'MAGISK_DAEMON_31100', 'MAGISK_SU', 'ALPHA_RESEARCH_APP_SU_POLICY',
+        'R115_BETA_ROOT_UI', 'R115_BETA_MODULE_UI',\n                   'R114_CONCEALMENT_APP_CONFIRMED', 'ALPHA_HIDDEN_ROOT_UID0',\n\
+        \                   'ANDROID_FRAMEWORK_RESTORED',\n                   'HIDE_BUTTON', 'HIDE_DIALOG', 'STUB_INSTALLED',
+        'REQUESTER_BOUND',\n                   'STUB_FOREGROUND', 'STUB_RESTORE_BUTTON', 'RESTORE_DIALOG',\n             \
+        \      'REQUESTER_CLEARED', 'ORIGINAL_FOREGROUND', 'MAGISK_SU_AFTER_RESTORE')\n\n\ndef extract_requester(output):\n\
+        \    lines = [line.strip() for line in output.splitlines() if line.startswith('value=')]\n    if not lines:\n    \
+        \    return ''\n    if len(lines) != 1:\n        raise RuntimeError('Unexpected multiple requester DB values')\n \
+        \   value = lines[0][6:]\n    if value and (not PACKAGE_RE.fullmatch(value) or value == ORIGINAL):\n        raise
+        RuntimeError('Malformed requester DB value')\n    return value\n\n\ndef find_node(xml_text, label):\n    root = ET.fromstring(xml_text)\n\
+        \    for node in root.iter('node'):\n        if label not in (node.get('text', ''), node.get('content-desc', '')):\n\
+        \            continue\n        match = re.fullmatch(r'\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]', node.get('bounds',
+        ''))\n        if not match:\n            continue\n        x0, y0, x1, y1 = map(int, match.groups())\n        if x1
+        > x0 and y1 > y0:\n            return ((x0 + x1) // 2, (y0 + y1) // 2)\n    raise RuntimeError('UI element not found:
+        ' + label)\n\n\ndef test_pure():\n    x = '<hierarchy><node text=\"Hide the Magisk app\" bounds=\"[12,20][52,80]\"\
+        \ /></hierarchy>'\n    assert find_node(x, 'Hide the Magisk app') == (32, 50)\n    for bad in ('random', 'com.topjohnwu.magisk',
+        'foo.bar;rm', 'UPPER.pkg'):\n        try:\n            extract_requester('value=' + bad)\n        except RuntimeError:\n\
+        \            pass\n        else:\n            raise AssertionError('Invalid requester accepted: ' + bad)\n    assert
+        extract_requester('') == ''\n    assert extract_requester('value=abc.def\\n') == 'abc.def'\n    assert len(REQUIRED_STAGES)
+        == len(set(REQUIRED_STAGES))\n    print('R9_SELFTEST_PASS: XML bounds, DB validation, unique strict gates')\n\n\n\
+        class R9:\n    def __init__(self):\n        self.workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()\n    \
+        \    self.report = self.workspace / 'reports' / 'r9_emulator'\n        self.report.mkdir(parents=True, exist_ok=True)\n\
+        \        self.apk = self.workspace / 'magisk' / 'out' / 'app-release.apk'\n        self.stages = {}\n        self.target
+        = None\n        self.original_present = False\n        self.error = None\n        self.root_setup_started = False\n\
+        \        self.restored_by_ui = False\n        self.original_visible_while_hidden = None\n\n    def cmd(self, argv,
+        *, timeout=45, check=True, output=None, cwd=None):\n        try:\n            p = subprocess.run(argv, cwd=cwd, text=True,
+        errors='replace',\n                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,\n            \
+        \                   timeout=timeout)\n            if output:\n                (self.report / output).write_text(p.stdout)\n\
+        \            if check and p.returncode:\n                raise RuntimeError(f'Command failed ({p.returncode}): {argv[:3]}:
+        {p.stdout[-700:]}')\n            return p.stdout.strip()\n        except subprocess.TimeoutExpired as e:\n       \
+        \     raise RuntimeError('Timed out: ' + str(argv[:3])) from e\n\n    def adb(self, remote, *, timeout=45, check=True,
+        output=None):\n        return self.cmd(['adb', 'shell', remote], timeout=timeout, check=check, output=output)\n\n\
+        \    def mark(self, stage):\n        self.stages[stage] = True\n        print('R9_PASS:', stage, flush=True)\n\n \
+        \   def identity(self):\n        devices = [line.split()[0] for line in self.cmd(['adb', 'devices']).splitlines()[1:]\n\
+        \                   if line.strip() and line.split()[-1] == 'device']\n        if len(devices) != 1 or not devices[0].startswith('emulator-'):\n\
+        \            raise RuntimeError('Strict R9 gate: exactly one AVD emulator required')\n        info = {key: self.adb('getprop
+        ' + key).strip() for key in EXPECTED}\n        info['adb_serial'] = devices[0]\n        (self.report / 'device.json').write_text(json.dumps(info,
+        indent=2) + '\\n')\n        if any(info.get(key) != expected for key, expected in EXPECTED.items()):\n           \
+        \ raise RuntimeError('Strict R9 gate: wrong device: ' + str(info))\n        self.mark('AVD_ONLY')\n\n    def requester(self):\n\
+        \        sql = 'SELECT value FROM settings WHERE key=\"requester\" LIMIT 1'\n        remote = '/data/adb/magisk/magisk
+        --sqlite ' + shlex.quote(sql)\n        return extract_requester(self.adb(remote))\n\n    def sqlite_clear_requester(self):\n\
+        \        sql = 'DELETE FROM settings WHERE key=\"requester\"'\n        return self.adb('/data/adb/magisk/magisk --sqlite
+        ' + shlex.quote(sql), check=False)\n\n    def ui_dump(self, label):\n        dest = self.report / (label + '.xml')\n\
+        \        remote = '/sdcard/r9_' + label + '.xml'\n        for attempt in range(1, 4):\n            try:\n        \
+        \        self.adb('uiautomator dump ' + shlex.quote(remote), timeout=55)\n                self.cmd(['adb', 'pull',
+        remote, str(dest)], timeout=25)\n                root = ET.parse(dest).getroot()\n                assert root.tag
+        == 'hierarchy' and len(list(root.iter('node'))) > 0\n                return dest.read_text()\n            except (RuntimeError,
+        ET.ParseError, AssertionError):\n                if attempt == 3:\n                    raise\n                time.sleep(2)\n\
+        \        raise RuntimeError('unreachable')\n\n    def tap(self, xml, text):\n        x, y = find_node(xml, text)\n\
+        \        self.adb(f'input tap {x} {y}')\n        time.sleep(2)\n\n    def focus(self, expected):\n        data = self.adb('dumpsys
+        activity activities', output='activity_' + expected.replace('.', '_') + '.txt')\n        matches = re.findall(r'topResumedActivity\\\
+        s*=\\s*ActivityRecord\\{[^\\n]*', data)\n        if not matches or not any((expected + '/') in s for s in matches):\n\
+        \            raise RuntimeError('Expected top-resumed package is absent: ' + expected)\n\n    def wait(self, action,
+        description, seconds=75):\n        deadline = time.monotonic() + seconds\n        last = None\n        while time.monotonic()
+        < deadline:\n            try:\n                value = action()\n                if value:\n                    return
+        value\n            except RuntimeError as e:\n                last = e\n            time.sleep(3)\n        raise RuntimeError('Timed
+        out waiting for ' + description + (' (' + str(last) + ')' if last else ''))\n\n    def root_setup(self):\n       \
+        \ self.identity()  # BEFORE any privilege escalation or installation\n        if not self.apk.is_file() or self.apk.stat().st_size
+        < 1_000_000:\n            raise RuntimeError('Pinned research APK is missing')\n        if self.requester_or_unavailable():\n\
+        \            raise RuntimeError('Emulator already has an unexpected Magisk manager binding')\n        self.original_present
+        = 'package:' in self.adb('pm path ' + ORIGINAL)\n        if not self.original_present:\n            raise RuntimeError('R8
+        research manager is not installed')\n        self.cmd(['adb', 'root'], timeout=35, output='adb_root.txt')\n      \
+        \  self.cmd(['adb', 'wait-for-device'], timeout=60)\n        if self.adb('id -u') != '0':\n            raise RuntimeError('ADB
+        root did not activate on this official AVD')\n        self.mark('ADB_ROOT')\n        # Official pinned Magisk script
+        (no third-party emulation root helper).\n        self.root_setup_started = True\n        self.cmd(['python3', 'build.py',
+        'emulator', str(self.workspace / 'alpha_31100.apk')], timeout=240,\n                 cwd=self.workspace / 'magisk',
+        output='alpha_31100_avd_setup.txt')\n        self.cmd(['adb', 'wait-for-device'], timeout=60)\n        version = self.adb('/data/adb/magisk/magisk
+        -V')\n        signature = self.adb('/data/adb/magisk/magisk -v')\n        if version != '31100' or 'alpha' not in
+        signature.lower():\n            raise RuntimeError('Actual Alpha 31100 daemon NOT running: '+repr((version,signature)))\n\
+        \        self.mark('ALPHA_DAEMON_31100')\n        self.mark('MAGISK_DAEMON_31100')\n        (self.report / 'alpha_runtime_identity.json').write_text(json.dumps({'version_code':version,\n\
+        \            'version':signature, 'backend':'actual vvb2060 Alpha 31100 APK native binaries',\n            'research_package':ORIGINAL,
+        'phone_modified':False},indent=2)+'\\n')\n        self.ensure_su('MAGISK_SU')\n        self.wait_for_framework() \
+        \ # Alpha APK bootstraps its actual native binaries in the emulator\n        if 'package:' not in self.adb('pm path
+        io.github.vvb2060.magisk',check=False):\n            raise RuntimeError('Actual Alpha 31100 manager package missing
+        after bootstrap')\n        if 'package:' not in self.adb('pm path '+ORIGINAL,check=False):\n            raise RuntimeError('Research
+        APK was replaced by Alpha installer')\n        self.mark('ALPHA_RESEARCH_COEXISTENCE')\n\n    def authorize_research_alpha_avd_only(self):\n\
+        \        \"\"\"Grant the already installed research app SU on the disposable Alpha AVD.\n\n        Alpha 31.1 no longer
+        opens an interactive SU popup. Prior R11.8 logcat showed\n        `su: request rejected (10174)` and the app showed
+        Magisk Not Installed.\n        This test explicitly provisions the app UID on an isolated QEMU instance.\n       \
+        \ It never changes the Alpha release binary, the research APK, or a phone.\n        \"\"\"\n        required=('AVD_ONLY','ADB_ROOT','ALPHA_DAEMON_31100','MAGISK_SU',\n\
+        \                  'ANDROID_FRAMEWORK_RESTORED','ALPHA_RESEARCH_COEXISTENCE')\n        if not all(self.stages.get(x)
+        for x in required):\n            raise RuntimeError('R118.1: Alpha AVD and backend prerequisites missing')\n     \
+        \   device={key:self.adb('getprop '+key) for key in EXPECTED}\n        if any(device.get(key)!=expected for key,expected
+        in EXPECTED.items()):\n            raise RuntimeError('R118.1: refusing SU provisioning outside API33 x86_64 QEMU')\n\
+        \        if self.adb('id -u') != '0':\n            raise RuntimeError('R118.1: ADB root not actually active in QEMU')\n\
+        \        if 'package:' not in self.adb('pm path '+ORIGINAL):\n            raise RuntimeError('R118.1: research APK
+        not installed, refusing change')\n        if 'package:' not in self.adb('pm path io.github.vvb2060.magisk'):\n   \
+        \         raise RuntimeError('R118.1: actual Alpha Manager not present')\n        props=self.adb('dumpsys package
+        '+ORIGINAL, output='r1181_research_pkg_before.txt')\n        uid_match=re.search(r'\\buserId=(\\d+)',props)\n    \
+        \    if not uid_match:\n            raise RuntimeError('R118.1: cannot establish actual research-app UID')\n     \
+        \   uid=int(uid_match.group(1))\n        if not 10000<=uid<=99999:\n            raise RuntimeError('R118.1: app UID
+        outside verified single-user range')\n        magisk='/data/adb/magisk/magisk'\n        alpha_version=self.adb(magisk+'
+        -v')\n        if 'alpha' not in alpha_version.lower() or self.adb(magisk+' -V')!='31100':\n            raise RuntimeError('R118.1:
+        installed daemon is not the pinned Alpha 31100')\n        sql=f'REPLACE INTO policies (uid,policy,until,logging,notification)
+        VALUES ({uid},2,0,1,1);'\n        self.adb(magisk+' --sqlite '+shlex.quote(sql), output='r1181_su_policy_write.txt')\n\
+        \        policy=self.adb(magisk+' --sqlite '+shlex.quote(f'SELECT policy FROM policies WHERE uid={uid};'),\n     \
+        \                   output='r1181_su_policy_read.txt')\n        if 'policy=2' not in policy and policy.strip()!='2':\n\
+        \            raise RuntimeError('R118.1: Alpha did not persist the app-specific SU grant')\n        (self.report/'R1181_AVD_SU_GRANT.json').write_text(json.dumps({\n\
+        \            'scope':'ANDROID_13_X86_64_QEMU_ONLY','research_package':ORIGINAL,\n            'package_uid':uid,'alpha_daemon_version':alpha_version,'authorized_policy':2,\n\
+        \            'ui_root_not_yet_proven':True,'boot_writes':False,\n            'physical_device_modified':False},indent=2)+'\\\
+        n')\n        self.mark('ALPHA_RESEARCH_APP_SU_POLICY')\n        self.adb('am force-stop '+ORIGINAL)\n        self.adb('am
+        start -W -n '+ACTIVITY,timeout=60)\n        self.focus(ORIGINAL)\n        # This is diagnostic, NOT a substitute for
+        the original module/root UI tests.\n        self.ui_dump('r1181_after_authorization_home')\n\n    def wait_for_framework(self,
+        *, timeout_seconds=180, poll_seconds=3):\n        \"\"\"After official avd_setup.sh stop/start, wait for system_server
+        services.\n\n        'adb wait-for-device' only proves adbd is responding, NOT that Android's\n        ActivityManager/PackageManager
+        have finished restarting. Never issue\n        UI interactions before both service binders and boot have recovered.\n\
+        \        \"\"\"\n        if not self.stages.get('AVD_ONLY') or not self.stages.get('ADB_ROOT'):\n            raise
+        RuntimeError('Framework wait requires verified AVD and ADB root')\n        deadline = time.monotonic() + timeout_seconds\n\
+        \        log = self.report / 'framework_wait.jsonl'\n        consecutive = 0\n        attempts = 0\n        probes
+        = (\n            ('zygote', 'getprop init.svc.zygote'),\n            ('boot', 'getprop sys.boot_completed'),\n   \
+        \         ('activity', 'service check activity'),\n            ('package', 'service check package'),\n           \
+        \ ('manager', 'pm path ' + ORIGINAL),\n        )\n        last = {}\n        while time.monotonic() < deadline:\n\
+        \            attempts += 1\n            status = {}\n            for name, remote in probes:\n                try:\n\
+        \                    status[name] = self.adb(remote, check=False, timeout=12)\n                except RuntimeError
+        as exc:\n                    status[name] = 'ADB_ERROR: ' + str(exc)[:220]\n            ready = (\n              \
+        \  status['zygote'] == 'running'\n                and status['boot'] == '1'\n                and 'Service activity:
+        found' in status['activity']\n                and 'Service package: found' in status['package']\n                and
+        'package:' in status['manager']\n            )\n            consecutive = consecutive + 1 if ready else 0\n      \
+        \      last = status\n            with log.open('a') as f:\n                f.write(json.dumps({'attempt': attempts,
+        'ready': ready,\n                                    'stable_passes': consecutive, 'services': status}) + '\\n')\n\
+        \            if consecutive >= 2:\n                self.mark('ANDROID_FRAMEWORK_RESTORED')\n                return\n\
+        \            time.sleep(poll_seconds)\n        try:\n            self.adb('logcat -d -t 400', timeout=35, check=False,\n\
+        \                     output='framework_recovery_logcat.txt')\n        except RuntimeError:\n            pass\n  \
+        \      raise RuntimeError('Android services not recovered after official Magisk AVD stop/start'\n                \
+        \           ' (activity, package, boot); see framework_wait.jsonl. '\n                           + json.dumps(last))\n\
+        \n    def requester_or_unavailable(self):\n        # Before activating the daemon its database might not exist.\n\
+        \        return self.adb('test -f /data/adb/magisk.db && echo present || true') == 'present'\n\n    def ensure_su(self,
+        stage):\n        result = self.adb('/debug_ramdisk/su -c id', timeout=40)\n        if 'uid=0(' not in result:\n  \
+        \          raise RuntimeError('Magisk SU did not grant uid=0: ' + result)\n        self.mark(stage)\n\n    def enable_gui(self):\n\
+        \        # The official Magisk AVD setup reinstalls the research APK and restarts\n        # Android. R8's earlier
+        POST_NOTIFICATIONS grant is not necessarily\n        # retained; in R9.3 the real permission-controller dialog blocked
+        focus.\n        # Never grant anything until the isolated rooted emulator is verified.\n        required = ('AVD_ONLY',
+        'ADB_ROOT', 'MAGISK_DAEMON_31100',\n                    'ANDROID_FRAMEWORK_RESTORED')\n        if not all(self.stages.get(stage)
+        for stage in required):\n            raise RuntimeError('R9 notification regrant requires verified rooted AVD and
+        framework')\n        self.adb('pm grant ' + ORIGINAL + ' android.permission.POST_NOTIFICATIONS',\n               \
+        \  output='r94_notification_grant.txt')\n        self.adb('am force-stop ' + ORIGINAL)\n        self.adb('am start
+        -W -n ' + ACTIVITY, timeout=50)\n        try:\n            self.wait(lambda: self._focus_is(ORIGINAL),\n         \
+        \             'Magisk foreground after Android 13 notification permission grant', seconds=60)\n        except RuntimeError:\n\
+        \            # Preserve what is actually covering the app, never fake a GUI_PASS.\n            self.adb('dumpsys activity
+        activities', check=False,\n                     output='r94_focus_failure_activities.txt')\n            raise\n  \
+        \      self.focus(ORIGINAL)\n        xml = self.ui_dump('root_home')\n        if 'Hide the Magisk app' not in xml:\n\
+        \            raise RuntimeError('Root manager-hiding button is not displayed in active Magisk UI')\n        self.mark('HIDE_BUTTON')\n\
+        \        self.tap(xml, 'Hide the Magisk app')\n        dialog = self.ui_dump('hide_dialog')\n        find_node(dialog,
+        'New name')\n        find_node(dialog, 'OK')\n        self.mark('HIDE_DIALOG')\n        self.tap(dialog, 'OK')\n\n\
+        \    def wait_stub_restore_ui(self):\n        \"\"\"Do not mistake a blank first Compose frame for a working hidden
+        manager.\n\n        Capture repeated real UI hierarchy snapshots; never synthesize the button.\n        The title
+        only counts if Android actually exposes a tappable node.\n        \"\"\"\n        label = 'Restore the Magisk app'\n\
+        \        attempts=[]\n        for index in range(1, 7):\n            xml = self.ui_dump(f'stub_probe_{index:02d}')\n\
+        \            (self.report / 'stub_home.xml').write_text(xml)\n            root = ET.fromstring(xml)\n            labels
+        = sorted(set(t for node in root.iter('node')\n                                for t in (node.get('text', ''),node.get('content-desc',
+        ''))\n                                if t))\n            probe={'index':index, 'total_nodes':len(list(root.iter('node'))),\n\
+        \                   'visible_labels':labels[:35], 'has_restore_button':False}\n            try:\n                find_node(xml,
+        label)\n                probe['has_restore_button']=True\n                attempts.append(probe)\n               \
+        \ (self.report/'R96_STUB_UI_READINESS.json').write_text(json.dumps(attempts,indent=2)+'\\n')\n                return
+        xml\n            except RuntimeError:\n                attempts.append(probe)\n                (self.report/'R96_STUB_UI_READINESS.json').write_text(json.dumps(attempts,indent=2)+'\\\
+        n')\n                if index < 6:\n                    time.sleep(5)\n        # Preserve diagnostics before the unconditional
+        emulator cleanup.\n        self.adb('dumpsys activity activities',output='r96_blank_ui_activities.txt',check=False)\n\
+        \        self.adb('logcat -d -v threadtime',timeout=95,output='r96_blank_ui_logcat.txt',check=False)\n        self.adb('screencap
+        -p /sdcard/r96_blank_ui.png',check=False)\n        self.cmd(['adb','pull','/sdcard/r96_blank_ui.png',str(self.report/'r96_blank_ui.png')],check=False)\n\
+        \        raise RuntimeError('R9.6: hidden manager has no Restore UI after six real snapshots; see R96_STUB_UI_READINESS.json
+        and Android diagnostics')\n\n    def capture_restore_state(self, phase):\n        \"\"\"Preserve the real post-confirm
+        state BEFORE the safety rollback.\n\n        Never mutate manager packages or database here. This method is\n    \
+        \    diagnostic only and must not convert a failed transaction into PASS.\n        \"\"\"\n        if not self.stages.get('AVD_ONLY')
+        or not self.stages.get('RESTORE_DIALOG'):\n            return\n        probes = (\n            ('original_package',
+        'pm path ' + ORIGINAL),\n            ('hidden_package', 'pm path ' + (self.target or 'invalid.package')),\n      \
+        \      ('activities', 'dumpsys activity activities'),\n            ('app_restore_trace', \"logcat -d -v brief -s 'R97Restore:*'\"\
+        ),\n        )\n        for name, command in probes:\n            try:\n                self.adb(command, timeout=35,
+        check=False,\n                         output=f'r97_{phase}_{name}.txt')\n            except Exception as e:\n   \
+        \             (self.report / f'r97_{phase}_{name}_error.txt').write_text(str(e) + '\\n')\n        try:\n         \
+        \   value = self.requester()\n            (self.report / f'r97_{phase}_requester.json').write_text(\n            \
+        \    json.dumps({'still_bound': bool(value), 'matches_hidden_package': value == self.target},\n                  \
+        \         indent=2) + '\\n')\n        except Exception as e:\n            (self.report / f'r97_{phase}_requester_error.txt').write_text(str(e)
+        + '\\n')\n        try:\n            self.ui_dump(f'r97_{phase}_foreground')\n        except Exception as e:\n    \
+        \        (self.report / f'r97_{phase}_ui_error.txt').write_text(str(e) + '\\n')\n\n    def alpha_hidden_root_ui(self):\n\
+        \        # Only the isolated Android 13 user-0 emulator; never grant root to the\n        # hidden manager artificially.
+        This measures the actual repackage flow.\n        if not self.target or not self._focus_is(self.target):\n       \
+        \     raise RuntimeError('R118: hidden package is not foreground')\n        label = 'Magisk und Root abfragen'\n \
+        \       found = False\n        for k in range(18):\n            xml = self.ui_dump('r118_hidden_root_button_' + str(k))\n\
+        \            tree = ET.fromstring(xml)\n            points=[]\n            for node in tree.iter('node'):\n      \
+        \          if node.get('text','') != label and node.get('content-desc','') != label: continue\n                match
+        = re.fullmatch(r'\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]', node.get('bounds',''))\n                if match:\n    \
+        \                x0,y0,x1,y1 = map(int,match.groups())\n                    if y0 >= 260 and y1 <= 2080 and x1 > x0
+        and y1 > y0:\n                        points.append(((x0+x1)//2,(y0+y1)//2))\n            if points:\n           \
+        \     self.adb(f'input tap {points[0][0]} {points[0][1]}')\n                found=True\n                break\n  \
+        \          self.adb('input swipe 525 760 525 1700 380' if k%2==0\n                     else 'input swipe 525 1750
+        525 720 380')\n            time.sleep(0.65)\n        if not found:\n            raise RuntimeError('R118: hidden manager
+        lacks accessible root control')\n        for k in range(25):\n            xml = self.ui_dump('r118_hidden_root_output_'+str(k))\n\
+        \            if 'UID=0' in xml and 'MAGISK=' in xml and 'alpha' in xml.lower():\n                self.mark('ALPHA_HIDDEN_ROOT_UID0')\n\
+        \                self.cmd(['adb','shell','monkey','-p',self.target,\n                          '-c','android.intent.category.LAUNCHER','1'],timeout=30,check=False)\n\
+        \                self.wait(lambda:self._focus_is(self.target),\n                          'hidden manager foreground
+        after Alpha root check',seconds=35)\n                return\n            if 'ERROR: ROOT_TIMEOUT' in xml or 'ERROR:
+        SU_EXIT_' in xml:\n                raise RuntimeError('R118: hidden manager cannot access SU under original Alpha
+        daemon')\n            time.sleep(1.5)\n        raise RuntimeError('R118: hidden manager UID=0 under actual Alpha daemon
+        not proven')\n\n    def hide_verify(self):\n        target = self.wait(self.requester, 'new requester DB binding')\n\
+        \        self.target = target\n        if 'package:' not in self.adb('pm path ' + shlex.quote(target)):\n        \
+        \    raise RuntimeError('Repackaged manager is not installed: ' + target)\n        self.mark('STUB_INSTALLED')\n \
+        \       # R11.4 AVD preflight: the ORIGINAL package must exist before the\n        # hidden app owns the concealment
+        step. Test harness NEVER uninstalls it.\n        if 'package:' not in self.adb('pm path ' + ORIGINAL, check=False):\n\
+        \            raise RuntimeError('R11.4: original package absent BEFORE app-owned removal')\n        if self.requester()
+        != target:\n            raise RuntimeError('Native requester package binding changed unexpectedly')\n        self.mark('REQUESTER_BOUND')\n\
+        \        self.wait(lambda: self._focus_is(target), 'migrated app foreground')\n        self.focus(target)\n      \
+        \  self.mark('STUB_FOREGROUND')\n        # Only the running hidden manager may perform the actual package change.\n\
+        \        # The harness observes, but does not call pm uninstall or reinstall.\n        def finalize_visible():\n \
+        \           xml = self.ui_dump('r114_concealment_button')\n            return xml if 'Complete Hide (AVD only)' in
+        xml else None\n        xml = self.wait(finalize_visible, 'AVD-only app-managed hide confirmation', seconds=70)\n \
+        \       find_node(xml, 'Complete Hide (AVD only)')\n        self.tap(xml, 'Complete Hide (AVD only)')\n        def
+        app_original_removed():\n            path = self.adb('pm path ' + ORIGINAL, check=False)\n            return 'package:'
+        not in path\n        self.wait(app_original_removed, 'app-owned original package removal', seconds=90)\n        self.original_visible_while_hidden
+        = 'package:' in self.adb('pm path ' + ORIGINAL, check=False)\n        user_list = self.adb('pm list packages --user
+        0 ' + ORIGINAL)\n        if ('package:' + ORIGINAL) in user_list.splitlines():\n            raise RuntimeError('R11.4:
+        original package still listed for user 0')\n        if not self._focus_is(target):\n            raise RuntimeError('R11.4:
+        hidden manager lost foreground after original removal')\n        trace = self.adb(\"logcat -d -v brief -s 'R114Conceal:*'\"\
+        , check=False,\n                         output='R114_APP_CONCEALMENT_TRACE.txt')\n        if 'ORIGINAL_UNINSTALLED_USER0_VERIFIED'
+        not in trace:\n            raise RuntimeError('R11.4: missing app-owned successful concealment trace')\n        self.mark('R114_CONCEALMENT_APP_CONFIRMED')\n\
+        \        self.alpha_hidden_root_ui()\n        xml = self.wait_stub_restore_ui()\n        find_node(xml, 'Restore the
+        Magisk app')\n        self.mark('STUB_RESTORE_BUTTON')\n        self.tap(xml, 'Restore the Magisk app')\n        dialog
+        = self.ui_dump('restore_dialog')\n        find_node(dialog, 'Restore the hidden manager to its original package?')\n\
+        \        find_node(dialog, 'OK')\n        self.mark('RESTORE_DIALOG')\n        self.r112_confirm_restore(dialog)\n\
+        \        self.capture_restore_state('after_confirm')\n\n    def r112_confirm_restore(self, initial_dialog):\n    \
+        \    \"\"\"Confirm the *actual* Android-13 dialog, never trust stale UI coordinates.\n\n        On the recorded R11
+        run, OK moved 101 px while the dialog animated;\n        the old harness tapped the stale position and did not invoke
+        restore.\n        A retry is permitted ONLY while the exact same restore prompt remains.\n        No requester/sqlite
+        mutation is performed by this helper.\n        \"\"\"\n        prompt = 'Restore the hidden manager to its original
+        package?'\n        title = 'Restore the Magisk app'\n        if prompt not in initial_dialog or title not in initial_dialog:\n\
+        \            raise RuntimeError('R11.2: initial restore confirmation dialog mismatch')\n        trace = []\n     \
+        \   trace_path = self.report / 'R112_RESTORE_CONFIRM_TRACE.json'\n        try:\n            for attempt in range(1,
+        4):\n                stable = None\n                prev = None\n                for snapshot in range(1, 6):\n  \
+        \                  fresh = self.ui_dump(f'r112_confirm_pre_{attempt}_{snapshot}')\n                    if prompt not
+        in fresh or title not in fresh:\n                        # Dialog disappeared: never tap a different window.\n   \
+        \                     trace.append({'attempt': attempt, 'event': 'dialog_absent_before_tap'})\n                  \
+        \      return\n                    xy = find_node(fresh, 'OK')\n                    trace.append({'attempt': attempt,
+        'snapshot': snapshot,\n                                  'ok_center': list(xy), 'event': 'observe'})\n           \
+        \         if xy == prev:\n                        stable = xy\n                        break\n                   \
+        \ prev = xy\n                    time.sleep(0.85)\n                if stable is None:\n                    raise RuntimeError('R11.2:
+        restore dialog OK never stabilized; no blind tap')\n                x, y = stable\n                self.adb(f'input
+        tap {x} {y}')\n                trace.append({'attempt': attempt, 'event': 'tap_stable_ok',\n                     \
+        \         'x': x, 'y': y})\n                time.sleep(2)\n                after = self.ui_dump(f'r112_confirm_after_{attempt}')\n\
+        \                if self.requester() == '':\n                    trace.append({'attempt': attempt, 'event': 'requester_cleared_by_app'})\n\
+        \                    return\n                if prompt not in after or title not in after:\n                    #
+        Dismissal has started; restore_verify() independently\n                    # validates the requester, original app
+        and root state.\n                    trace.append({'attempt': attempt, 'event': 'dialog_closed_wait_for_transaction'})\n\
+        \                    return\n                trace.append({'attempt': attempt, 'event': 'same_dialog_still_open'})\n\
+        \            raise RuntimeError('R11.2: restore OK dialog persisted after 3 verified taps')\n        finally:\n  \
+        \          trace_path.write_text(json.dumps(trace, indent=2) + '\\n')\n\n    def _focus_is(self, package):\n     \
+        \   data = self.adb('dumpsys activity activities')\n        return any(package + '/' in m for m in re.findall(r'topResumedActivity\\\
+        s*=\\s*ActivityRecord\\{[^\\n]*', data))\n\n    def restore_verify(self):\n        self.wait(lambda: self.requester()
+        == '', 'cleared Magisk requester binding')\n        self.mark('REQUESTER_CLEARED')\n        self.wait(lambda: self._focus_is(ORIGINAL),
+        'original Magisk manager foreground')\n        self.focus(ORIGINAL)\n        xml = self.ui_dump('restored_home')\n\
+        \        if 'Home' not in xml or 'Magisk' not in xml:\n            raise RuntimeError('Restored Magisk home is missing
+        UI labels')\n        self.mark('ORIGINAL_FOREGROUND')\n        if 'package:' not in self.adb('pm path ' + ORIGINAL,
+        check=False):\n            raise RuntimeError('R11.4: original package not reinstalled after restore')\n        self.mark('R114_ORIGINAL_REINSTALLED')\n\
+        \        self.ensure_su('MAGISK_SU_AFTER_RESTORE')\n        self.restored_by_ui = True\n        self.capture_restore_state('success')\n\
+        \n    def cleanup(self):\n        if not self.stages.get('AVD_ONLY'):\n            return\n        # Never confuse
+        manual recovery with a successful feature restore.\n        if self.root_setup_started and self.original_present:\n\
+        \            try:\n                if self.requester():\n                    self.sqlite_clear_requester()\n     \
+        \               (self.report / 'manual_rollback.txt').write_text('Native requester DB cleared after incomplete UI
+        restoration.\\n')\n            except Exception as e:\n                (self.report / 'manual_rollback_error.txt').write_text(str(e)
+        + '\\n')\n            if self.target and PACKAGE_RE.fullmatch(self.target):\n                try:\n              \
+        \      self.cmd(['adb', 'uninstall', self.target], timeout=55, check=False,\n                             output='emulator_stub_cleanup.txt')\n\
+        \                except Exception as e:\n                    (self.report / 'stub_cleanup_error.txt').write_text(str(e)
+        + '\\n')\n\n    def finish(self):\n        if self.stages.get('AVD_ONLY'):\n            try:\n                self.adb('logcat
+        -d -v threadtime', timeout=90, output='logcat.txt')\n                self.adb('dumpsys activity activities', output='final_activities.txt')\n\
+        \            except Exception as e:\n                (self.report / 'log_collection_error.txt').write_text(str(e))\n\
+        \        ok = self.error is None and all(self.stages.get(x) for x in REQUIRED_STAGES)\n        outcome = {\n     \
+        \       'base': 'UNCHANGED pinned R11.6.1 research APK + actual released Magisk Alpha 31100 backend',\n          \
+        \  'test': 'Alpha 31100 daemon with researched Magisk 30.0 Hide/Restore backport in Android 13 AVD',\n           \
+        \ 'checks': self.stages, 'missing_checks': [s for s in REQUIRED_STAGES if s not in self.stages],\n            'root_permissions_tested':
+        bool(self.stages.get('MAGISK_SU')),\n            'hide_and_restore_tested': bool(self.restored_by_ui),\n         \
+        \   'physical_device_modified': False, 'target': self.target,\n            'original_visible_while_hidden': self.original_visible_while_hidden,\n\
+        \            'actual_package_concealment_proven': self.original_visible_while_hidden is False,\n            'physical_device_ready':
+        False,\n            'alpha_runtime_tested':True,\n            'alpha_runtime_pass':bool(self.stages.get('ALPHA_DAEMON_31100')),\n\
+        \            'alpha_full_hide_restore_pass':bool(self.restored_by_ui) and self.original_visible_while_hidden is False
+        and self.stages.get('ALPHA_HIDDEN_ROOT_UID0') is True,\n            'active_alpha_daemon':self.stages.get('ALPHA_DAEMON_31100')
+        is True,\n            'sidecar_manager_is_stock_signed':False,\n            'phone_install_authorized':False,\n  \
+        \          'boot_partition_changed':False,\n            'error': self.error,\n            'result': 'ROOT_HIDE_RESTORE_PASS'
+        if ok else 'ROOT_HIDE_RESTORE_FAILED_OR_INCOMPLETE',\n        }\n        (self.report / 'R9_RESULT.json').write_text(json.dumps(outcome,
+        indent=2) + '\\n')\n        print('R9 actual root and hide/restore outcome:', outcome['result'], flush=True)\n   \
+        \     if self.error:\n            print('R9 FAILED STAGE:', self.error, file=sys.stderr, flush=True)\n        return
+        0 if ok else 1\n\n    def r11_module_roundtrip(self):\n        # Identity and genuine Magisk daemon/root must have
+        been checked already.\n        if not all(self.stages.get(x) for x in ('AVD_ONLY','MAGISK_DAEMON_31100','MAGISK_SU')):\n\
+        \            raise RuntimeError('R11 module test requires official rooted Android-13 QEMU')\n        import io, zipfile\n\
+        \        mod='r11_beta_e2e_probe'\n        basedir='/data/adb/modules/'+mod\n        descriptor='id='+mod+'\\nname=R11
+        E2E Testmodul\\nversion=1\\nversionCode=1\\nauthor=R11-Automation\\ndescription=Isolated CI verification only\\n'\n\
+        \        # Populate a benign fixture in the same on-device directory that Magisk's UI reads.\n        self.adb('mkdir
+        -p '+basedir)\n        self.adb('printf %s '+shlex.quote(descriptor)+' > '+basedir+'/module.prop')\n        self.adb('chmod
+        0644 '+basedir+'/module.prop')\n        if 'R11 E2E Testmodul' not in self.adb('cat '+basedir+'/module.prop'):\n \
+        \           raise RuntimeError('R11 module fixture not installed on AVD')\n        self.mark('R11_MODULE_VISIBLE_ON_DISK')\n\
+        \        self.adb('pm grant '+ORIGINAL+' android.permission.POST_NOTIFICATIONS', check=False)\n        self.adb('am
+        force-stop '+ORIGINAL)\n        self.adb('am start -W -n '+ACTIVITY,timeout=50)\n        xml=self.ui_dump('r11_home_before_module')\n\
+        \        self.tap(xml,'Modules')\n        # Verify native Magisk ModuleScreen renders the fixture.\n        def module_ui():\n\
+        \            xml=self.ui_dump('r11_modules_screen')\n            return xml if 'R11 E2E Testmodul' in xml else None\n\
+        \        xml=self.wait(module_ui,'Magisk Modules UI fixture',seconds=80)\n        self.mark('R11_MODULE_UI_VISIBLE')\n\
+        \        def toggle(xml, expected_checked):\n            root=ET.fromstring(xml)\n            matches=[]\n       \
+        \     for node in root.iter('node'):\n                # Compose/Android UIAutomator puts the accessible label on a\n\
+        \                # nested child, while checked/clickable live on its parent.\n                if node.get('checkable')!='true'
+        or node.get('clickable')!='true':\n                    continue\n                if not any(child.get('content-desc','')=='R11
+        E2E Testmodul'\n                           for child in node.iter('node')):\n                    continue\n      \
+        \          matches.append(node)\n            if len(matches)!=1:\n                raise RuntimeError('R11: expected
+        exactly one target module switch, found '+str(len(matches)))\n            node=matches[0]\n            desired='true'
+        if expected_checked else 'false'\n            if node.get('checked')!=desired:\n                raise RuntimeError('R11:
+        wrong module switch state: expected '+desired+\n                                   ', got '+str(node.get('checked')))\n\
+        \            bounds=re.fullmatch(r'\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]',node.get('bounds',''))\n            if
+        not bounds:\n                raise RuntimeError('R11: labeled module switch has no valid bounds')\n            x0,y0,x1,y1=map(int,bounds.groups())\n\
+        \            if x1<=x0 or y1<=y0:\n                raise RuntimeError('R11: invalid nonpositive switch area')\n  \
+        \          self.adb(f'input tap {(x0+x1)//2} {(y0+y1)//2}')\n            time.sleep(2)\n        toggle(xml, True)\n\
+        \        self.wait(lambda:self.adb('test -f '+basedir+'/disable && echo YES || true')=='YES',\n                  'module
+        disabled marker from actual GUI',seconds=35)\n        self.mark('R11_MODULE_GUI_DISABLED')\n        xml=self.ui_dump('r11_module_disabled')\n\
+        \        toggle(xml, False)\n        self.wait(lambda:self.adb('test ! -e '+basedir+'/disable && echo YES || true')=='YES',\n\
+        \                  'module enabled marker from actual GUI',seconds=35)\n        self.mark('R11_MODULE_GUI_ENABLED')\n\
+        \        self.adb('input keyevent KEYCODE_BACK')\n        self.adb('am start -W -n '+ACTIVITY,timeout=50)\n      \
+        \  # Real Magisk CLI install goes to its staging location until next boot.\n        archive=self.report/'r11_module_install.zip'\n\
+        \        with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:\n            z.writestr('module.prop',descriptor)\n\
+        \        self.cmd(['adb','push',str(archive),'/data/local/tmp/r11_module_install.zip'])\n        result=self.adb('/data/adb/magisk/magisk
+        --install-module /data/local/tmp/r11_module_install.zip',timeout=95,check=False,\n                        output='r11_magisk_module_install.txt')\n\
+        \        staged=self.adb('test -f /data/adb/modules_update/'+mod+'/module.prop && echo YES || true')\n        if staged!='YES':\n\
+        \            raise RuntimeError('R11 actual Magisk CLI ZIP installation not staged: '+result[-700:])\n        self.mark('R11_MODULE_CLI_INSTALL_STAGED')\n\
+        \n    def r115_integrated_beta_ui(self):\n        \"\"\"Operate the REAL combined APK's root/module UI, then allow
+        regular R11.4 Hide/Restore.\"\"\"\n        import io, json, zipfile\n        if not all(self.stages.get(x) for x in
+        ('AVD_ONLY','MAGISK_DAEMON_31100','MAGISK_SU')):\n            raise RuntimeError('R115: tested AVD root prerequisites
+        not satisfied')\n        if self.adb('getprop ro.kernel.qemu')!='1' or self.adb('getprop ro.build.version.sdk')!='33':\n\
+        \            raise RuntimeError('R115: no physical device, only Android 13 AVD')\n        if self.adb('getprop ro.product.cpu.abi')!='x86_64':\n\
+        \            raise RuntimeError('R115: wrong emulator architecture')\n        module='r11_beta_e2e_probe'\n      \
+        \  rootdir='/data/adb/modules/'+module\n        # R11 original GUI test already placed this benign fixture.\n    \
+        \    if self.adb('test -f '+rootdir+'/module.prop && echo PASS || true')!='PASS':\n            raise RuntimeError('R115:
+        original GUI test fixture missing')\n        # Pre-grant only on this disposable AVD; the ACTUAL APP must still execute
+        su.\n        text=self.adb('dumpsys package '+ORIGINAL)\n        uid_match=re.search(r'\\buserId=(\\d+)',text)\n \
+        \       if not uid_match:raise RuntimeError('R115: cannot identify running app UID')\n        uid=int(uid_match.group(1))\n\
+        \        assert uid>=10000\n        sql=f'REPLACE INTO policies (uid,policy,until,logging,notification) VALUES ({uid},2,0,1,1);'\n\
+        \        self.adb('/data/adb/magisk/magisk --sqlite '+shlex.quote(sql))\n        policy=self.adb('/data/adb/magisk/magisk
+        --sqlite '+shlex.quote(f'SELECT policy FROM policies WHERE uid={uid};'))\n        if 'policy=2' not in policy and
+        policy.strip()!='2':\n            raise RuntimeError('R115: root policy not established for AVD test app')\n     \
+        \   self.adb('am force-stop '+ORIGINAL)\n        self.adb('am start -W -n '+ACTIVITY,timeout=60)\n        report={'test':'R115
+        integrated manager same APK Root+Module+Hide+Restore','scope':'Android-13 rooted QEMU only',\n                'package':ORIGINAL,'uid':uid,'actions':{},'alpha_31100_tested':False,\n\
+        \                'boot_partition_written':False,'physical_device_modified':False}\n        def save():\n         \
+        \   (self.report/'R115_INTEGRATED_BETA_UI.json').write_text(json.dumps(report,indent=2)+'\\n')\n        def nodes(stage,index):\n\
+        \            xml=self.ui_dump(f'r115_{stage}_{index}')\n            return xml,ET.fromstring(xml)\n        def next_action(root,
+        label, attempt):\n            \"\"\"Choose only an actually visible tap; otherwise scroll in the needed direction.\n\
+        \n            The R11.5 evidence showed the MODULES label at y=92..147, ABOVE\n            Android's fixed top bar.
+        A blind upward swipe moved it farther off-screen.\n            \"\"\"\n            for node in root.iter('node'):\n\
+        \                if node.get('text','') != label and node.get('content-desc','') != label:\n                    continue\n\
+        \                m = re.fullmatch(r'\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]', node.get('bounds',''))\n            \
+        \    if not m:\n                    continue\n                x0,y0,x1,y1 = map(int, m.groups())\n               \
+        \ if x0 >= x1 or y0 >= y1:\n                    continue\n                if y0 >= 260 and y1 <= 2080:\n         \
+        \           return 'tap',((x0+x1)//2,(y0+y1)//2)\n                if y1 <= 260:\n                    return 'down',None\
+        \  # finger DOWN = content DOWN; uncover control above\n                if y0 >= 2080:\n                    return
+        'up',None   # finger UP = content UP; uncover control below\n            # Compose may omit items beyond the viewport.
+        Start by searching towards\n            # the top, then scan down. Do not assume every missing item is below us.\n\
+        \            return ('down' if attempt < 6 else 'up'),None\n\n        def click(label,stage):\n            for k in
+        range(20):\n                _,tree=nodes(stage,k)\n                action,position=next_action(tree,label,k)\n   \
+        \             if action=='tap':\n                    x,y=position\n                    self.adb(f'input tap {x} {y}')\n\
+        \                    time.sleep(1.1)\n                    return\n                if action=='down':\n           \
+        \         self.adb('input swipe 525 760 525 1700 420')\n                else:\n                    self.adb('input
+        swipe 525 1700 525 760 420')\n                time.sleep(0.6)\n            save()\n            raise RuntimeError('R115.1:
+        visible beta control not found after bidirectional search: '+label)\n        def await_label(needle,stage,timeout=50):\n\
+        \            for k in range(max(2,int(timeout/2))):\n                xml,tree=nodes(stage,k)\n                if needle
+        in xml:return xml\n                # The integrated Beta card is below the proven Magisk AppCard.\n              \
+        \  # If not yet visible, scroll the SAME live app instead of\n                # accepting a stale XML from another
+        package.\n                if k % 2 == 0:\n                    self.adb('input swipe 525 1770 525 740 425')\n     \
+        \           time.sleep(1.5)\n            save();raise RuntimeError('R115: missing actual app output: '+needle)\n \
+        \       # Verify the presence of the integrated panel from the SAME official Magisk package.\n        await_label('R11
+        Funktions-Beta', 'panel')\n        click('Magisk und Root abfragen','root_button')\n        await_label('UID=0','root_output')\n\
+        \        report['actions']['ROOT_FROM_INTEGRATED_UI']='PASS';save()\n        click('Installierte Module anzeigen','modules_button')\n\
+        \        await_label('r11_beta_e2e_probe | ENABLED','modules_output')\n        report['actions']['MODULE_LIST_FROM_INTEGRATED_UI']='PASS';save()\n\
+        \        # Read-only Superuser rule list, not native CLI in a detached test process.\n        click('Superuser-Regeln
+        anzeigen','policies_button')\n        xml=await_label('policy=2','policies_output',timeout=60)\n        if 'ERROR:'
+        in xml:raise RuntimeError('R115: beta UI Superuser list reported error')\n        report['actions']['SUPERUSER_LIST_FROM_INTEGRATED_UI']='PASS';save()\n\
+        \        # Enter fixture module ID into Beta card's own edit field.\n        for k in range(8):\n            _,tree=nodes('module_edit',k)\n\
+        \            items=[n for n in tree.iter('node') if n.get('class')=='android.widget.EditText']\n            pos=None\n\
+        \            for n in items:\n                m=re.fullmatch(r'\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]',n.get('bounds',''))\n\
+        \                if m:\n                    x0,y0,x1,y1=map(int,m.groups())\n                    if y0>=260 and y1<=2080:pos=((x0+x1)//2,(y0+y1)//2);break\n\
+        \            if pos:break\n            self.adb('input swipe 525 790 525 1790 410')\n            time.sleep(0.6)\n\
+        \        else:save();raise RuntimeError('R115: module ID field not visible')\n        self.adb(f'input tap {pos[0]}
+        {pos[1]}')\n        self.adb('input text '+module)\n        self.adb('input keyevent KEYCODE_BACK') # hide keyboard\n\
+        \        time.sleep(0.7)\n        def perform(label,stage,marker,exists):\n            click(label,stage)\n      \
+        \      click('Ausführen',stage+'_confirm')\n            check='test '+(' -f ' if exists else ' ! -e ')+rootdir+'/'+marker+'
+        && echo PASS || true'\n            for k in range(25):\n                if self.adb(check)=='PASS':return\n      \
+        \          time.sleep(2)\n            save();raise RuntimeError('R115: beta action not reflected in real Magisk module
+        file: '+label)\n        perform('Modul deaktivieren','disable','disable',True)\n        report['actions']['MODULE_DISABLE_FROM_INTEGRATED_UI']='PASS';save()\n\
+        \        perform('Modul aktivieren','enable','disable',False)\n        report['actions']['MODULE_ENABLE_FROM_INTEGRATED_UI']='PASS';save()\n\
+        \        perform('Entfernung vormerken','remove','remove',True)\n        report['actions']['MODULE_REMOVE_MARKED_BY_INTEGRATED_UI']='PASS';save()\n\
+        \        self.adb('rm -f '+rootdir+'/remove') # controlled cleanup on throwaway fixture\n        # ZIP selector and
+        import are a separate strict gate; never claim ZIP UI was tested.\n        report['actions']['MODULE_ZIP_INSTALL_FROM_INTEGRATED_UI']='NOT_TESTED'\n\
+        \        report['result']='R115_INTEGRATED_BETA_UI_PARTIAL_PASS'\n        save()\n        self.mark('R115_BETA_ROOT_UI')\n\
+        \        self.mark('R115_BETA_MODULE_UI')\n        # Restore initial navigation so the pinned R9 Hide/Restore harness
+        continues.\n        self.adb('am force-stop '+ORIGINAL)\n        self.adb('am start -W -n '+ACTIVITY,timeout=60)\n\
+        \    def run(self):\n        try:\n            self.root_setup()\n            self.authorize_research_alpha_avd_only()\n\
+        \            self.r11_module_roundtrip()\n            self.r115_integrated_beta_ui()\n            self.enable_gui()\n\
+        \            self.hide_verify()\n            self.restore_verify()\n        except Exception as e:\n            self.error
+        = str(e)\n            if self.stages.get('RESTORE_DIALOG'):\n                self.capture_restore_state('before_cleanup')\n\
+        \        finally:\n            self.cleanup()\n            return self.finish()\n\n\nif __name__ == '__main__':\n\
+        \    if len(sys.argv) == 2 and sys.argv[1] == '--selftest':\n        test_pure()\n    elif len(sys.argv) == 1:\n \
+        \       if not os.environ.get('GITHUB_WORKSPACE'):\n            sys.exit('R9 only supports the isolated GitHub Actions
+        emulator runner')\n        sys.exit(R9().run())\n    else:\n        sys.exit('Usage: r9_root_emulator.py [--selftest]')\n\
+        \nPY_R118_STRICT_ALPHA\npython3 -m py_compile r118_alpha31100.py\npython3 r118_alpha31100.py --selftest\n"
+    - name: Allow KVM on isolated GitHub emulator only
+      shell: bash
+      run: 'set -euo pipefail
+
+        if [ ! -e /dev/kvm ]; then echo ''KVM_UNAVAILABLE'' >&2; exit 1; fi
+
+        sudo chmod 0666 /dev/kvm
+
+        test -w /dev/kvm'
+    - name: R11.8.1 - Real Alpha 31100 + authorized research app full E2E in isolated emulator
+      id: alpha_e2e
+      uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+      with:
+        api-level: 33
+        target: google_apis
+        arch: x86_64
+        profile: pixel_5
+        cores: 2
+        ram-size: 3072M
+        emulator-boot-timeout: 900
+        emulator-options: -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -camera-back none
+        script: adb install -r magisk/out/app-release.apk && python3 r118_alpha31100.py
+    - name: R11.8.1 - Strict Alpha 31100 compatibility summary
+      shell: bash
+      if: always()
+      env:
+        E2E_RESULT: ${{ steps.alpha_e2e.outcome }}
+      run: "set -euo pipefail\nmkdir -p reports/r118\npython3 - <<'PY_R118_REPORT'\nimport json,os,pathlib\np=pathlib.Path('reports/r9_emulator/R9_RESULT.json')\n\
+        r=json.loads(p.read_text()) if p.exists() else {}\nchecks=r.get('checks') or {}\nexpected={'ALPHA_DAEMON_31100','ALPHA_RESEARCH_COEXISTENCE','ALPHA_RESEARCH_APP_SU_POLICY','R115_BETA_ROOT_UI',\n\
+        \          'R115_BETA_MODULE_UI','R114_CONCEALMENT_APP_CONFIRMED','ALPHA_HIDDEN_ROOT_UID0','MAGISK_SU_AFTER_RESTORE'}\n\
+        ok=os.environ['E2E_RESULT']=='success' and r.get('result')=='ROOT_HIDE_RESTORE_PASS' and all(checks.get(x) is True
+        for x in expected)\nreport={'revision':'R11.8.1',\n        'actual_alpha_31100_backend_verified':checks.get('ALPHA_DAEMON_31100',False),\n\
+        \        'research_root_module_ui_pass':all(checks.get(x,False) for x in ('R115_BETA_ROOT_UI','R115_BETA_MODULE_UI')),\n\
+        \        'manager_hide_and_restore_with_alpha_pass':ok,\n        'original_hide_concealment_pass':checks.get('R114_CONCEALMENT_APP_CONFIRMED',False),\n\
+        \        'raw_e2e_result':r.get('result','NOT_EXECUTED'),\n        'android_avd_job_outcome':os.environ['E2E_RESULT'],\n\
+        \        'errors':r.get('error'),\n        'real_phone_compatibility':'NOT_PROVEN',\n        'boot_partition_written':False,\n\
+        \        'phone_installation_authorized':False,\n        'result':'ALPHA31100_AVD_FULL_PASS' if ok else 'ALPHA31100_AVD_NOT_PROVEN'}\n\
+        pathlib.Path('reports/r118/R118_FINAL.json').write_text(json.dumps(report,indent=2)+'\\n')\nprint('R11.8 evaluated
+        Alpha runtime outcome:',report['result'])\nPY_R118_REPORT\n"
+    - name: Upload diagnostic evidence (never release unproven phone APK)
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: R1181_ALPHA_AVD_AUTHORIZED_E2E_DIAG
+        path: reports/
+        if-no-files-found: error
+        retention-days: 14
+    - name: R11.8.1 - Require real Alpha Root/Modules/Hide/Restore before any phone beta
+      shell: bash
+      run: "set -euo pipefail\npython3 - <<'PY_R118_STRICT_END'\nimport json\nr=json.load(open('reports/r118/R118_FINAL.json'))\n\
+        if r['result'] != 'ALPHA31100_AVD_FULL_PASS':\n raise SystemExit('R118 HOLD: true Alpha 31100 Hide/Restore not proven;
+        see diagnostic artifact')\nprint('R118 green: exact research APK works in Alpha 31100 AVD. PHONE STILL NOT AUTHORIZED.')\n\
+        PY_R118_STRICT_END"
+    - name: Retain same tested research APK only for isolated AVD (not phone beta)
+      uses: actions/upload-artifact@v7
+      with:
+        name: R118_ALPHA_AVD_PASSED_RESEARCH_ONLY_NO_PHONE
+        path: magisk/out/app-release.apk
+        if-no-files-found: error
+        retention-days: 7

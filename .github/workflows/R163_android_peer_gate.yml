@@ -1,0 +1,122 @@
+name: R16.3 - Android kernel-peer and Magisk Manager integration
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-r163-test-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+      - name: Validate and unpack pinned R163_main.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import zipfile,stat,hashlib
+          source = Path('R163_main.zip')
+          if not source.is_file(): raise SystemExit('Missing R163_main.zip in repository root; main.zip is a different older archive')
+          if hashlib.sha256(source.read_bytes()).hexdigest() != '4f940591fcaa363b3852f1fb062396e23ee9e31f24347afc2ad648c17646ae65':
+              raise SystemExit('R163_MAIN_SHA256_MISMATCH: expected the verified R16.3 source; do not use old main.zip')
+          with zipfile.ZipFile(source) as z:
+              if z.testzip() is not None: raise SystemExit('Corrupt main.zip')
+              seen=set()
+              for entry in z.infolist():
+                  n=entry.filename
+                  parts=PurePosixPath(n).parts
+                  if n.startswith('/') or '\\' in n or '..' in parts or n in seen or stat.S_IFMT(entry.external_attr>>16)==stat.S_IFLNK:
+                      raise SystemExit('UNSAFE_ZIP_ENTRY: '+n)
+                  seen.add(n)
+              z.extractall('source')
+          for name in ('CMakeLists.txt','src/main.cpp','app/build.gradle.kts','app/src/main/AndroidManifest.xml','scripts/r161_validate_apk.py','app/src/main/java/dev/sweet414/audit/Magisk31100Gate.java','app/src/main/java/dev/sweet414/audit/AndroidRootPeerProbe.java','app/src/main/java/dev/sweet414/audit/MagiskManagerInspector.java'):
+              if not (Path('source')/name).is_file(): raise SystemExit('MISSING: '+name)
+          PY
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Prepare Android SDK and NDK from Ubuntu runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner already has Android command-line tools. Do NOT invoke
+          # android-actions/setup-android@v3: its sdkmanager "tools" install
+          # is rejected by the modern SDK repositories (run 43074102368).
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK" || { echo "ANDROID_SDK_DIR_MISSING: $SDK"; exit 1; }
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            for candidate in "$SDK"/cmdline-tools/*/bin/sdkmanager; do
+              if [[ -x "$candidate" ]]; then SDKMANAGER="$candidate"; break; fi
+            done
+          fi
+          test -x "$SDKMANAGER" || { echo 'sdkmanager missing on runner'; exit 1; }
+          echo "SDK manager: $SDKMANAGER"
+          if [[ ! -f "$SDK/platforms/android-35/android.jar" || ! -x "$SDK/build-tools/35.0.0/aapt2" ]]; then
+            "$SDKMANAGER" --sdk_root="$SDK" 'platforms;android-35' 'build-tools;35.0.0'
+          fi
+          test -f "$SDK/platforms/android-35/android.jar" || { echo 'Android 35 platform missing'; exit 1; }
+          test -x "$SDK/build-tools/35.0.0/aapt2" || { echo 'Android 35 build-tools missing'; exit 1; }
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
+            NDK="$SDK/ndk/27.2.12479018"
+            if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
+              "$SDKMANAGER" --sdk_root="$SDK" 'ndk;27.2.12479018'
+            fi
+          fi
+          test -f "$NDK/build/cmake/android.toolchain.cmake" || { echo 'Android NDK missing'; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "Android SDK/NDK ready: $SDK / $NDK"
+      - name: R16.3 native, parser and kernel-peer gate tests
+        working-directory: source
+        run: bash scripts/test_r161_host.sh
+      - name: Build Android ARM64 native executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash source/scripts/build_r160_android_arm64.sh
+          mkdir -p source/app/src/main/jniLibs/arm64-v8a
+          cp source/android-stage/lib/arm64-v8a/libsweet414_preflight.so source/app/src/main/jniLibs/arm64-v8a/libsweet414_preflight.so
+          python3 source/scripts/r160_check_android_elf.py --binary source/app/src/main/jniLibs/arm64-v8a/libsweet414_preflight.so
+      - name: Build Android APK and validate embedded executable
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          SHA="$(python3 -c 'import json;print(json.load(open("android-stage/R160_ANDROID_ARM64_NATIVE_MANIFEST.json"))["sha256"])')"
+          gradle --no-daemon --stacktrace -PnativeSha256="$SHA" :app:assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          mkdir -p reports
+          python3 scripts/r161_validate_apk.py --apk "$APK" --sha256 "$SHA" --output reports/R161_ANDROID_APK_CHECK.json
+          # Ensure DEX includes the new real Android OS gate classes (not test-only stubs).
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          from pathlib import Path
+          a=Path('app/build/outputs/apk/debug/app-debug.apk')
+          with ZipFile(a) as z:
+              dex=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex'))
+          for expected in (b'AndroidRootPeerProbe',b'Magisk31100Gate',b'MagiskManagerInspector'):
+              if expected not in dex: raise SystemExit('APK_MISSING_HARDENED_GATE: '+expected.decode())
+          print('R163_APK_GATE_CLASSES_PRESENT=YES; UID_0_AND_MAGISKD=NOT_PROVEN')
+          PY
+          cp "$APK" R163-SWEET-android-peer-gate-test.apk
+      - name: Publish APK and static audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: R163-SWEET-Android-Peer-Gate-Diagnostic
+          path: |
+            source/R163-SWEET-android-peer-gate-test.apk
+            source/reports/R161_ANDROID_APK_CHECK.json
+            source/R163_README_DE.md
+          if-no-files-found: error

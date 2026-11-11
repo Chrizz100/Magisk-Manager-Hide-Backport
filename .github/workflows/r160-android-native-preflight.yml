@@ -1,0 +1,61 @@
+name: R16.0 - Isolated Android ARM64 preflight binary
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android-native-preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout isolated development repository
+        uses: actions/checkout@v4
+      - name: Validate source archive paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import zipfile, pathlib, stat
+          p=pathlib.Path('main.zip')
+          if not p.is_file(): raise SystemExit('Missing main.zip')
+          with zipfile.ZipFile(p) as z:
+              seen=set()
+              for obj in z.infolist():
+                  n=obj.filename
+                  parts=pathlib.PurePosixPath(n).parts
+                  if n.startswith('/') or '..' in parts or '\\' in n or n in seen:
+                      raise SystemExit('Unsafe ZIP archive entry')
+                  if stat.S_IFMT(obj.external_attr>>16)==stat.S_IFLNK:
+                      raise SystemExit('Symlink ZIP entry rejected')
+                  seen.add(n)
+              z.extractall('source')
+          PY
+      - name: Select Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
+            echo 'Install NDK 27.2 via installed sdkmanager'
+            SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+            test -n "$SDK"
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" 'ndk;27.2.12479018' || true
+            NDK="$SDK/ndk/27.2.12479018"
+          fi
+          test -f "$NDK/build/cmake/android.toolchain.cmake" || { echo 'Android NDK missing'; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+      - name: Compile and validate Android ARM64 executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash source/scripts/build_r160_android_arm64.sh
+          test -s source/android-stage/lib/arm64-v8a/libsweet414_preflight.so
+          python3 source/scripts/r160_check_android_elf.py \
+            --binary source/android-stage/lib/arm64-v8a/libsweet414_preflight.so
+          (cd source/android-stage && zip -q -r ../R160_NATIVE_ARM64_PREPARED.zip lib R160_ANDROID_ARM64_NATIVE_MANIFEST.json)
+      - name: Publish native diagnostic artifact (not APK, not root)
+        uses: actions/upload-artifact@v4
+        with:
+          name: R160-android-arm64-readonly-preflight
+          path: source/R160_NATIVE_ARM64_PREPARED.zip
+          if-no-files-found: error

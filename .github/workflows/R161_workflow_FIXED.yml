@@ -1,0 +1,91 @@
+name: R16.1 - Isolated Android native process test APK
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-r161-test-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+      - name: Validate and unpack pinned R161_main.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import zipfile,stat,hashlib
+          source = Path('R161_main.zip')
+          if not source.is_file(): raise SystemExit('Missing R161_main.zip in repository root; main.zip is the older archive')
+          if hashlib.sha256(source.read_bytes()).hexdigest() != '6d9c4d069d30defd5e72102e8c3d005f1e6d641a8d99b7b7f7e3d46e62feda28':
+              raise SystemExit('R161_MAIN_SHA256_MISMATCH: expected the verified R16.1 source; do not use old main.zip')
+          with zipfile.ZipFile(source) as z:
+              if z.testzip() is not None: raise SystemExit('Corrupt main.zip')
+              seen=set()
+              for entry in z.infolist():
+                  n=entry.filename
+                  parts=PurePosixPath(n).parts
+                  if n.startswith('/') or '\\' in n or '..' in parts or n in seen or stat.S_IFMT(entry.external_attr>>16)==stat.S_IFLNK:
+                      raise SystemExit('UNSAFE_ZIP_ENTRY: '+n)
+                  seen.add(n)
+              z.extractall('source')
+          for name in ('CMakeLists.txt','src/main.cpp','app/build.gradle.kts','app/src/main/AndroidManifest.xml','scripts/r161_validate_apk.py'):
+              if not (Path('source')/name).is_file(): raise SystemExit('MISSING: '+name)
+          PY
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Prepare SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
+            sdkmanager 'ndk;27.2.12479018' >/dev/null
+            NDK="${ANDROID_HOME}/ndk/27.2.12479018"
+          fi
+          test -f "$NDK/build/cmake/android.toolchain.cmake"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+      - name: Host native and parser regression tests
+        working-directory: source
+        run: bash scripts/test_r161_host.sh
+      - name: Build Android ARM64 native executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash source/scripts/build_r160_android_arm64.sh
+          mkdir -p source/app/src/main/jniLibs/arm64-v8a
+          cp source/android-stage/lib/arm64-v8a/libsweet414_preflight.so source/app/src/main/jniLibs/arm64-v8a/libsweet414_preflight.so
+          python3 source/scripts/r160_check_android_elf.py --binary source/app/src/main/jniLibs/arm64-v8a/libsweet414_preflight.so
+      - name: Build Android APK and validate embedded executable
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          SHA="$(python3 -c 'import json;print(json.load(open("android-stage/R160_ANDROID_ARM64_NATIVE_MANIFEST.json"))["sha256"])')"
+          gradle --no-daemon --stacktrace -PnativeSha256="$SHA" :app:assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          mkdir -p reports
+          python3 scripts/r161_validate_apk.py --apk "$APK" --sha256 "$SHA" --output reports/R161_ANDROID_APK_CHECK.json
+          cp "$APK" R161-SWEET-android-process-test.apk
+      - name: Publish APK and static audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: R161-SWEET-Android-Process-Test-APK
+          path: |
+            source/R161-SWEET-android-process-test.apk
+            source/reports/R161_ANDROID_APK_CHECK.json
+            source/R161_STATUS_DE.md
+          if-no-files-found: error

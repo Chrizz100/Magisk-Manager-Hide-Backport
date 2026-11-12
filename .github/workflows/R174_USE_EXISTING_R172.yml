@@ -1,0 +1,144 @@
+name: R17.4 - SWEET Root-child bridge Android ARM64 hardened
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-root-child-peer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Reconstruct and verify R17.4 from existing R172 ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_SOURCE'
+          import base64,hashlib,json,stat,zipfile,zlib
+          from pathlib import Path,PurePosixPath
+          base=Path('R172_main.zip')
+          if not base.is_file(): raise SystemExit('R174_BASE_MISSING: R172_main.zip expected in repository root')
+          if hashlib.sha256(base.read_bytes()).hexdigest()!='86f3b5ff40e51e256ada8d2d457204d44f4ff74a39bd75fc6356649862234efe':
+              raise SystemExit('R174_BASE_SHA256_MISMATCH')
+          out=Path('source')
+          with zipfile.ZipFile(base) as zz:
+              if zz.testzip() is not None: raise SystemExit('R174_CORRUPT_BASE')
+              names=set()
+              for info in zz.infolist():
+                  n=info.filename
+                  if n in names or n.startswith('/') or '\\' in n or '..' in PurePosixPath(n).parts or stat.S_IFMT(info.external_attr>>16)==stat.S_IFLNK:
+                      raise SystemExit('R174_UNSAFE_SOURCE: '+n)
+                  names.add(n)
+              zz.extractall(out)
+          # Reproducible, pinned replacements, never applying an unverified patch to older ZIP.
+          updates={
+              'src/root_peer.cpp':('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','ff042922c5a64b360651e8c433e389261251f9998d16b15411828e87e45f6529'),
+              'src/peer_policy.hpp':('eNqNVmFv2zgM/Z5fwXVA4QyNk7S97pI0AYbrDhiGHYbrdnffDNVmEqGyZEhykmLrfz/SlhOnSYcYLVDL5CMf9Uj2bWHFIhdgdIqdt1KnqswQblPnM6n9rHXkvJV6kawkrtvHks5R5IeWeyeHRqbw0mih2mdK5tK7WaejRY6uECmCWyP66+E1/OgQRpl6uMOVTPFThtpL/0TnQA+lOx63MoTUkAGhTI5/FjZdSo+pL+1rJo9oNarX/HVmjcwSiwqFew0il6VMiJ3FnLIVBPY86XT6ffi2RPDCLtBTotp5ob2jnBCo5syLC6OeADeCCFMscEtTqgw0rtDCAwLFFRvMGMvJvCBbb4DIaLKGUj9qs9aBAWMaEPD1w/193JFaSY11VNwU9gjvP0LpYApnVfnPJqe4fWiVlF0F1/jm+jTnz3Wq5HYdD+lnNOgVaOe9xftMjK4yfEgHiCfmUV8NYw2vTnP5QvfE9v9Q6EE8ot9vn//8+P2/L6e535v0Ef1f7ZKRYnvWGE8s0PZWw9OAvor0USywQcpwFTdosSgzyTfBV35PqiNh+CULhtSjFGbw/dMdmDm8M6UNwilquHcXQTckDWEfpLfCPoEoCnaJGa+fCS/67okSy/vBy8WKWhsk6RIKa/hiKUhT3NoW5lJhDP9KT/IkoaYpOseAnJlDy41KUp2XDh0LlFK1flJ9NSpDzrNQMpUeej3Kp1cSck7qI59cELOtXKtSNRPjtiRFX10mfgbkkMytyZMm6YSTjirzMJjOqUTd9pQ4AmPRlcofNDFw7Pp0vSSmUANT1/KHSOqLyqLbwG/dZe1fJwDWrKPKbrJvFYKE1C8qMiuhStzZyTlEbyICgNmsMezCz5/N3/BmuqeaLsvLS93GoOu4K7nMwiPQcLGSLsNYyIWaG5sH5VSBHVDnkzRKb3LhyYOGULyXTF0pzmCb1jbtKrHtW4x54Z8iPtwi8LMzmEtNtyet84k2PjHz6GwwvLy6/u3m/e+jsy5za9VpPNaFcd09LIvVyKusdKkUXe2Od6mdXGiipwxVuQpJTTXYGXjqgh/bDyEUjdlox2gCz1tzql+6hCiOY7rvo6FbxlyrGnnW2ORoZZrUK26nvfE4F5vDKtW+tzAc0MN1bcCGI3q6v2YeLok58S0mqXB+FzEK1CrzOuOA1rTBc6fpuwdjVFhUSc780UXVAHuxhc9h0wVtcJNi4UM3BNBNnG73ybS1XM7JJxZ7O2P6YolUJmGJ8cewJM7Pt0wJYX8R1yBhSFX+L3dwZcED/4AnNSvpPSmsXFGzLzCLmpqxaLk/wxvS62t0eYRRhAEHx+blIBTNvWqeJqmSlFVChnvBDtCpiRtWYXDTWKsGqcVFqYQFWpc9mrMWrNALnBAA/dOASkG/GdZ94I0UN3h/D2/iKzAPPKepS4aDy9Fw0uwTwTOSJE8bw3Eb0e4wFM3u1sYLzrNp0Crx5vfbaS3VA+qBMcUw63aJaWGVQiUvKt3U6RcVP1bLfT9KaYfOF9L+zAk+cz0O/+fs/A+lbLLu','ae97bf6018e13e9f826bb84846acbd8b5b91d7fa093d6ae3cc4a88fe8a84691a'),
+              'tests/peer_policy_test.cpp':('eNrNVn9v2jAQ/Z9PcTVSlaw0OAito5RKVcekqqvW0XXapEmRlxxgkcTIcfghxHffhQCjHSBYK1ELoth+fvfe2bmkKGM/TAME1kfUXl+F0h873X6fFYqLqYvEBDjysW8uC8UA2zJGaDW/Pt60mpav4sCGQMEEZNs6yvs2mK5WQ6B15+c6jY2M0EOtlbZYW8gQg3NgUJxh6zCFYZfGLG6vhJQqMRpFdLkqYzFUkLGBSMjYsicFoJYmMu5ALCJM+sJHSIaIpupW67PZDB03eN6hoImBjziQPt4ESNrMGHAkfDPpXSsaIJJS70r7XWnQN6mm3i3qGEMajQOtZFDq3clUTnO+RSKM0B00XiSM38XEmjHa5O7kJH4KPHqGnLABpiNWgqdBYREVlmEhj7sb618zTOhocBayTT725XsulFUdl341fko7pbSmcfZy1RvTwdwKe3XSpVr2nbxw5wP9v91+aj7+uGPro9BJDMOx19dyQIe3g4HFS3y9nnVQl1dq7q7wGXgDO4765AYDzw8lnWYvlXP8evJ18ArnfHc03494PXwOIqNquDS4RfYaPN8D/3xr8qqRtVmJklRYqIDk5QVC6lrMV5FjkEqFy13OwYVyIIwoO47zK2bL5ZsaC3DgLKqQI9JAZkQkd0mUJqjLnLjs+pItr00iNQqoeqQihAZQHr22VpFHha0nOph4M33ZZWXlwvh82fExvMtvG408Syvmp7umYIOHylYPCyXbdDsDEabo0euA27nAyn8JzPZImS7qHXK7PBrbhL1WmmJlKMzb0ZM9iG9HzXyzXvgcHdpAR+jfxH9QIdVKrVp7f1ap1WoH1cEPux21Lf73qEMZzb+aZkp8lRq4uADWcs+q3n2z2fLuv3y+uf7ZYNlwPJsrr9zD/dXDA1hd+ow9VXE4hvzLGrJXSmKT1HphWvgDX3pnzQ==','65ce181203f5675a9a69762ab886c236578e776010aefe926990a7fa9b83ab6c'),
+              'tests/test_r172_guards.py':('eNq1Vl9P4zgQf++nsHhJomsDhWpZeuoDYgtXLRRUympPHGe5zoR669o52wGq+/I7dtpQaOG0u7qoTZx4/s9vZizmhTaOFMxNpZg0RPVqYLWy5aQwmoO19ZdFvSyVcA6sazRGl5dj0luJSa/wGVOaCwmUJqkBq+UDxElaMAPK2dv2XeO6P/rSHyFT4N0lkTU88k+jtaMFgEl5UUSNq8vzwcmfW+g8CS20FHyRTj1lg0tmLTkrmcnGaJaNVwam/vWEWUi6DYJXBjnx3yk8Me7vBXAHGXXM3IOLLch8SemvApVXVqAnDKngycVJvZ1rQywRisSRfQRwUZNEjBk+/dDxy07axt/RXqsAk7fuDzN2dJDBhO8B+O32gb9/QZq99Aj/48+n/ZuvF9Gafn95k1L0DowbqNg2SZE0XroyZ45PwaIzwjqh7qlpfzigTGVGi4xiEidAreazTf+0zNbCayAHTBKHEOTjin+EObnCeF95Mek39sCimj0oRgEGUgve79hEs+ugacjmgDs78e3fO3e/JTvo6mYgnyO57qQdajfUCuIgfitN/5+SyWo/vTe6LOJ2grEMSei0Oy0PpJZHSeuhHW2VMDYlxOh+KmwA61vGqA0tnumFDy+TETA8AYTGW0G3vaoAtkJqTfc5ll5sU6EyeIoxOUzKBWZTPKC595DFERpTby9VHZ/Sm+Hga7TdLIQE9XJoKbKftQojEmGleAkJJtW+RwRrVC/Nqcrt/4iTsMvSXuF/WdlJQv79S9XsLut2ORjzQ0EMfSc3ek5nYBTIDYtfRuD6kl71+6OTUf8TxmDTmdfike8BFShN7RSkpNpQbLkO5j8UGd+U8D8RWQZq2ZwqKb7dwBNw7Md+WegCVFjZKp/LJfbs1VsusI3Suc5KueRxhvFqKTR3Mn6nW2EZYxRqU7agAD0NuLTO+Lb1KNxUl853LJ3/LBoqrdHF8dng+vOn3uhmOBwMz6Lm20BdkQ4vxxQVDE4HPl8bxk50qTIbakhjj/yV+pmdY6MGNRZzQH8vLDbKoz283rNydsGeRvAtTKsTrRQuhFaedb/zHh8qYtmCconY7naVfvyPsmWcQ+E68Vsyq9ZrU47hcGvkSbP9OmKleu5WHsxTHeYu8NKbThV4tNsSJUBmX8dzIhQzi7XplE5KIbOWFxLm02azfx5MIidKu6WMNMxFGyfdyg87E4U/FcSRl0WC2ECOs01INpGwNjK4nhcSO5mfk88notSUKr5F2MaVCj98Wq1Qvy0Pjii8s6JoYSWFWb+3f9SO7pqEs8KV2PIw70Xpen4MNYlHy2pZYaK3/1aCaoMQaChJcZ0hW3x42CSHH5MtFZazGdTNMKQAncATiVv8CoQr5SRn0sLvZHeX/FHH0pKLm+sxGfb9IU8GpFflhFmhVOHBgNJeL6J4bhGK0qhbnyZT/wV1fgfzbU1H','c7dea664fbcb5d609c8c8a74cf2412760bea89c28a83d7ec9fac8663c7e96032'),
+              'tests/test_r174_guards.py':('eNqdVVtv2zYUfvev0JskVFLmNkBWD3oYUq8wlhsco8WQBQRFHdlcKJLjxbG3P79DSXa6pLaH6UEgpXP7zuU7jVFtpKlbCV5FvNXKuOgOr6Ph7CV3Dqzb3Q2M5mUQSAhpuABC0sKAVWINSVpoakA6+zB+HN1P51+m8zKZn8XWsDOjlCMawBRM6zjo0Jo42LgkHd3dXs0uf9uLBimileBsW6zeCDNBrY1u4Pmzp6a2yS7AYoGvS2ohnYwifGpoovCdVMrLmjxzWavnxIJoBoHwhGuB9sC4mUzipytuHcgFb0F5d22jMvr4Az5xFvVw0oOa13Qzhz+AOagvlZR44EoGA+/P4+yI8o065Hn8vvP8re4LJsyH5zWpFVgiMbOwWVGPPxpu8M32EZwA/O6dGYI+GmQQZYJjaTGufPzTSeH7W3I3nc4v59NPBxB0/UCxMLxGs9xtSQWNMkAEJuJI1FdgbdJbLLCksEli7A4htkQbvsaGXEKdxGn2bxHr6smEN9ahbGh39kSXg6s4Tf+jH24xzZR1YRuF2XfULAF7Mo3+/l3ubQRXDIz5P0Hs00O17gsMiApq0uCYDt4HxROVrWFd2GcAdz4+L6ivuYuzfs4OFi346/wMHmwX28lad7CkF0LpVz72aLAqlG07QK2qgVjHhUA4GmecuxNI8hyTkaPuyUiQfSzsUpdgcdYPHx4P9J9UfQsuDcX2k8vXQWAvRky1LdY64jJCmOCCVaSCcETK291gAwzJr/uxxSFuu6NWGmR3ajgyVMDtRS/FFXOiF3KGMvz4jd/v0sMQyPeRaKOcYkoQL9mKytD/xxO6a4s8JCAPbJuvxye74/7rdLpALTK/vV10002+jE+W5Prnz7P7Xz+VN6iDcrNfZgcZQUkcYiWxgN6tlOF/Ydsb0GJ7BM70T0/FbkwZEr0LhZJ10rNVhjM4fj1Z3ql99VfqLdkMi876CjPLkAb2f6oSN1RReS7qPGievc1k/GKmiZCYo6qADU6RTdJJF7d94jpsqiSuuKRm2wltAQXRrItfEknLlwgK42XygMSRVGmGA4HQ15ArySB+zBjVziNx4t7Q3pUL4yELu3I49Rul/HCoRBS3K+pLhoOZJRcX2cWPSEYYPSGStrjfyzImpKVcEhJP9ts2fMBt/A+zSKXU','9e0893312fd2200ab06484cabb594f90934e7806becbcea0328e28b097cf6aa0'),
+              'CMakeLists.txt':('eNp9kcFygjAQhu88RY5wwA5Tp54ZjQ7TAi2g9ZbBZNW0kNAQWvv2TXTqWCrmsJnd7P9nv4TW5TuQmgtedzVR8NFxBcxd4SyP0gTdj4IHz2mUfAOq3fYLQI+DMVFSakL3vGJkXwomt1v0FCaLZbjAOZqu157TgnancfiIiUlJXoTJLMxmKJgMHZEMvyyjDM9QmvR78LrAiZ0nR+l87jklYwQOQDtdbio4j+XbsfwGQKFW0bvjkDYb0abxHF2qHWjCBa06BoQZTqql4tBeM3jOolVYYGt0llJZN7wCIhvNpbgp81/LqjIRDlqVdldKKs/hWzdJC2SIszSaeQ4yC4SFIBpazcXOPRV7hNabNLLi9PvYiGxo7/rlE6jV34D95/UH9ULcxx0UDsD+ctheNwljjFQwGZMLGzRN49g8BupbD4qFFKoTwjwUaUF9GhWVwtxK9dnryq/4frmRnXEFwcwXeM4P83oCxQ==','eb90713373adce290f875565b21e0153ca8c1452c60e91d12749af6798cb9185'),
+              'README_DE.md':('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','d556393137a98c56082f746a17282924253b938688f097ca1ed796673eedc589'),
+          }
+          for rel,(payload,expected_sha) in updates.items():
+              target=out/rel
+              value=zlib.decompress(base64.b64decode(payload))
+              if hashlib.sha256(value).hexdigest()!=expected_sha: raise SystemExit('R174_PAYLOAD_SHA256_MISMATCH: '+rel)
+              target.parent.mkdir(parents=True,exist_ok=True)
+              target.write_bytes(value)
+              if hashlib.sha256(target.read_bytes()).hexdigest()!=expected_sha: raise SystemExit('R174_WRITTEN_FILE_SHA256_MISMATCH: '+rel)
+          if 'sweet414-root-peer-v1' not in (out/'src/peer_policy.hpp').read_text(): raise SystemExit('R174_SOCKET_CHANGED')
+          if 'ROOT_PEER_NOT_ROOT' not in (out/'src/root_peer.cpp').read_text(): raise SystemExit('R174_MISSING_ROOT_GUARD')
+          print('R174_SOURCE_RECONSTRUCTED_SHA256_VERIFIED')
+          PY_SOURCE
+      - name: Host C++ tests, Python guards and non-root refusal
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S source -B source/.build-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build source/.build-host -j 2
+          ctest --test-dir source/.build-host --output-on-failure
+          python3 -m unittest discover -s source/tests -p 'test_*.py' -v
+          source/.build-host/peer_policy_test
+          set +e
+          source/.build-host/sweet414-root-peer --serve-once >/tmp/r174_nonroot.log 2>&1
+          rc=$?
+          set -e
+          if [[ "$rc" != 77 && "$rc" != 78 ]]; then
+            cat /tmp/r174_nonroot.log
+            echo R174_UNPRIVILEGED_EXECUTION_UNEXPECTED; exit 1
+          fi
+          echo R174_HOST_START_REFUSED_AS_EXPECTED=$rc
+      - name: Strict host Clang regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang++ --version
+          clang++ -std=c++17 -O0 -Wall -Wextra -Werror -fsyntax-only -I source/src source/src/root_peer.cpp
+          echo R174_STRICT_CLANG_ZERO_WARNINGS
+      - name: Prepare Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK" || { echo 'Android SDK missing'; exit 1; }
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [[ ! -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++" ]]; then
+            NDK="$SDK/ndk/27.2.12479018"
+            if [[ ! -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++" ]]; then
+              MGR="$SDK/cmdline-tools/latest/bin/sdkmanager"
+              if [[ ! -x "$MGR" ]]; then
+                for p in "$SDK"/cmdline-tools/*/bin/sdkmanager; do
+                  if [[ -x "$p" ]]; then MGR="$p"; break; fi
+                done
+              fi
+              test -x "$MGR" || { echo 'sdkmanager missing'; exit 1; }
+              "$MGR" --sdk_root="$SDK" 'ndk;27.2.12479018'
+            fi
+          fi
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          echo "R174_NDK=$NDK" >> "$GITHUB_ENV"
+      - name: Build Android AArch64 PIE with static C++ runtime and verify ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          CXX="$R174_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -fPIE -pie -static-libstdc++ -I source/src \
+            source/src/root_peer.cpp -o artifacts/R174-sweet414-root-peer-arm64
+          file artifacts/R174-sweet414-root-peer-arm64 | tee artifacts/R174_BINARY_TYPE.txt
+          readelf -h artifacts/R174-sweet414-root-peer-arm64 | tee artifacts/R174_ELF_HEADER.txt
+          readelf -l artifacts/R174-sweet414-root-peer-arm64 | tee artifacts/R174_ELF_SEGMENTS.txt
+          readelf -d artifacts/R174-sweet414-root-peer-arm64 | tee artifacts/R174_ELF_DYNAMIC.txt
+          python3 - <<'PY_ELF'
+          from pathlib import Path
+          import hashlib,json,re
+          header=Path('artifacts/R174_ELF_HEADER.txt').read_text()
+          segments=Path('artifacts/R174_ELF_SEGMENTS.txt').read_text()
+          dynamic=Path('artifacts/R174_ELF_DYNAMIC.txt').read_text()
+          if 'AArch64' not in header or 'DYN (Position-Independent Executable file)' not in header or '/system/bin/linker64' not in segments:
+              raise SystemExit('R174_BAD_ANDROID_ARM64_ELF')
+          needed=re.findall(r'Shared library: \[([^]]+)\]', dynamic)
+          if 'libc++_shared.so' in needed:
+              raise SystemExit('R174_MISSING_CPP_RUNTIME_REGRESSION: libc++_shared.so not bundled')
+          allowed={'libc.so','libm.so','libdl.so'}
+          if not set(needed).issubset(allowed):
+              raise SystemExit('R174_UNEXPECTED_DYNAMIC_DEPENDENCIES: '+str(needed))
+          p=Path('artifacts/R174-sweet414-root-peer-arm64')
+          report={'revision':'R17.4','binary_name':p.name,'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),
+                  'elf':'AArch64 PIE; Android linker64','dynamic_libraries':needed,
+                  'cpp_runtime':'linked statically; libc++_shared.so dependency forbidden',
+                  'root_exploit_included':False,'magiskd_started':False,'hardware_test':'NOT_RUN','uid0_proven':False}
+          Path('artifacts/R174_BUILD_REPORT.json').write_text(json.dumps(report,indent=2)+'\n')
+          print('R174_ANDROID_ELF_DEPENDENCIES_OK='+','.join(needed))
+          PY_ELF
+          sha256sum artifacts/R174-sweet414-root-peer-arm64 | tee artifacts/SHA256SUMS.txt
+      - name: Publish root-child ARM64 bridge (not a root package)
+        uses: actions/upload-artifact@v4
+        with:
+          name: R174-SWEET-RootChild-ARM64-PROVIDER-ABSENT
+          path: |
+            artifacts/
+            source/README_DE.md
+          if-no-files-found: error

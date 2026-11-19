@@ -1,7 +1,7 @@
-# R13.19.9 fixes setup/dispatch handling of run44448376001.
+# R13.19.10 fixes lost Magisk ZIP metadata in the update fixture from run44555563616.
 # Default: explicitly setup inspection only, no APK or Android tests.
 # build_release still requires the preserved signer and all R13.19.8 gates.
-name: Magisk R13.19.9 - Einrichtung prüfen oder signierten APK-Build ausführen
+name: Magisk R13.19.10 - Einrichtung prüfen oder signierten APK-Build ausführen
 permissions:
   contents: read
 'on':
@@ -17,7 +17,7 @@ permissions:
         - build_release
 jobs:
   r13199-signing-setup:
-    name: R13.19.9 Signiereinrichtung prüfen – erzeugt keine APK
+    name: R13.19.10 Signiereinrichtung prüfen – erzeugt keine APK
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -424,7 +424,7 @@ jobs:
                 (present if exists else missing).append(public_name)
             report = {
                 "schema": SCHEMA,
-                "revision": "R13.19.9",
+                "revision": "R13.19.10",
                 "operation": public_operation,
                 "status": "REQUEST_INVALID",
                 "error_code": None,
@@ -492,7 +492,7 @@ jobs:
             summary = env.get("GITHUB_STEP_SUMMARY")
             if summary:
                 lines = [
-                    "## R13.19.9 – Signiereinrichtung", "",
+                    "## R13.19.10 – Signiereinrichtung", "",
                     "**Status:** `" + report["status"] + "`", "",
                     "**Auftrag:** `" + report["operation"] + "`", "",
                     "Dieser Schritt prüft ausschließlich Vorhandensein und Format der Konfiguration.",
@@ -6418,7 +6418,7 @@ jobs:
         python3 -m py_compile R1317_4ABI_VERIFY.py
         python3 R1317_4ABI_VERIFY.py magisk reports/R1317_4ABI_NATIVE_APK_BINDING.json
         git -C magisk diff --check
-    - name: R13.19.8 - Build verified same-signer synthetic update fixture (public APK only)
+    - name: R13.19.10 - Preserve Magisk ZIP metadata in the verified update fixture
       shell: bash
       run: |
         set -euo pipefail
@@ -6506,6 +6506,19 @@ jobs:
             return matches[0][0], int(matches[0][1])
 
 
+        def magisk_zip_comment(apk: Path) -> bytes:
+            # Magisk's native manager check reads versionCode from the ZIP EOCD
+            # comment before comparing the APK certificate. Manifest equality is
+            # insufficient. Validate the real metadata, never synthesize it.
+            with zipfile.ZipFile(apk) as archive:
+                comment = archive.comment
+            versions = [line for line in comment.splitlines()
+                        if line.startswith(b"versionCode=")]
+            if versions != [f"versionCode={VERSION_CODE}".encode("ascii")]:
+                raise ValueError("MAGISK_ZIP_COMMENT_VERSION_CODE_MISSING_OR_WRONG")
+            return comment
+
+
         def build(args: argparse.Namespace) -> dict:
             release = Path(args.release_apk).resolve()
             out = Path(args.out_dir).resolve()
@@ -6522,6 +6535,7 @@ jobs:
                 raise ValueError("Release is not the required complete Magisk 31100 package")
             if signer(args.apksigner, release) != expected:
                 raise ValueError("Release signer differs from the explicitly pinned identity")
+            release_comment = magisk_zip_comment(release)
             original = payload(release)
             if ASSET in original:
                 raise ValueError("A synthetic fixture cannot be supplied as the release APK")
@@ -6542,6 +6556,9 @@ jobs:
                 unsigned = temp / "unsigned.apk"
                 aligned = temp / "aligned.apk"
                 with zipfile.ZipFile(release) as source, zipfile.ZipFile(unsigned, "w") as target:
+                    # Preserve EOCD metadata BEFORE alignment and signing. Adding
+                    # this comment to an already signed APK invalidates its signature.
+                    target.comment = source.comment
                     for info in source.infolist():
                         if not signature_entry(info.filename):
                             target.writestr(info, source.read(info))
@@ -6550,6 +6567,14 @@ jobs:
                     info.external_attr = 0o100644 << 16
                     target.writestr(info, json.dumps(marker, sort_keys=True).encode() + b"\n")
                 checked([args.zipalign, "-P", "16", "-f", "4", str(unsigned), str(aligned)])
+                # Android zipalign 37 strips the EOCD comment even if it was
+                # preserved in unsigned.apk. Restore it on the unsigned aligned
+                # file; never change metadata after apksigner has signed it.
+                with zipfile.ZipFile(aligned, "a") as aligned_archive:
+                    aligned_archive.comment = release_comment
+                checked([args.zipalign, "-c", "-P", "16", "4", str(aligned)])
+                if magisk_zip_comment(aligned) != release_comment:
+                    raise ValueError("ALIGNED_FIXTURE_MAGISK_ZIP_COMMENT_MISMATCH")
                 checked([
                     args.apksigner, "sign", "--ks", str(Path(args.keystore).resolve()),
                     "--ks-key-alias", args.alias,
@@ -6561,6 +6586,9 @@ jobs:
             checked([args.zipalign, "-c", "-P", "16", "4", str(fixture)])
             if signer(args.apksigner, fixture) != expected:
                 raise ValueError("Fixture signer differs from the release signer")
+            fixture_comment = magisk_zip_comment(fixture)
+            if fixture_comment != release_comment:
+                raise ValueError("FIXTURE_MAGISK_ZIP_COMMENT_CHANGED_AFTER_SIGNING")
             modified = payload(fixture)
             if set(modified) != set(original) | {ASSET}:
                 raise ValueError("Fixture APK has unexpected payload paths")
@@ -6585,6 +6613,9 @@ jobs:
                 "certificate_sha256": expected, "signer_sha256": expected,
                 "package": PACKAGE, "version_code": VERSION_CODE,
                 "manifest_sha256": sha256(original["AndroidManifest.xml"]),
+                "magisk_zip_comment_sha256": sha256(release_comment),
+                "magisk_zip_comment_version_code": VERSION_CODE,
+                "magisk_zip_comment_preserved": True,
                 "native_sha256": native, "fixture_asset": ASSET,
                 "payload_same_except_fixture_asset": True,
                 "android_runtime_execution": "NOT_PERFORMED_BY_FIXTURE_BUILDER",
@@ -7608,6 +7639,13 @@ jobs:
             require(re.fullmatch(r"[0-9a-f]{64}", document.get("certificate_sha256", "")) is not None, "Missing verified certificate fingerprint")
             with zipfile.ZipFile(release) as original, zipfile.ZipFile(fixture) as modified:
                 require(original.testzip() is None and modified.testzip() is None, "APK CRC check failed")
+                require(original.comment == modified.comment, "FIXTURE_MAGISK_ZIP_COMMENT_MISSING_OR_CHANGED")
+                comment_versions = [line for line in original.comment.splitlines()
+                                    if line.startswith(b"versionCode=")]
+                require(comment_versions == [b"versionCode=31100"], "MAGISK_ZIP_COMMENT_VERSION_CODE_MISSING_OR_WRONG")
+                require(document.get("magisk_zip_comment_preserved") is True, "Missing verified ZIP-comment preservation evidence")
+                require(document.get("magisk_zip_comment_version_code") == 31100, "Wrong native ZIP-comment version evidence")
+                require(digest(original.comment) == document.get("magisk_zip_comment_sha256"), "ZIP-comment hash differs from fixture report")
                 require(FIXTURE_ASSET not in original.namelist() and FIXTURE_ASSET in modified.namelist(), "Release/fixture role mismatch")
                 require(original.read("AndroidManifest.xml") == modified.read("AndroidManifest.xml"), "Fixture manifest differs")
                 require(digest(original.read("AndroidManifest.xml")) == document.get("manifest_sha256"), "Manifest hash differs")
@@ -7703,6 +7741,9 @@ jobs:
                     "apk_sha256": self.inputs["release_apk_sha256"],
                     "fixture_apk_sha256": self.inputs["fixture_apk_sha256"],
                     "fixture_manifest_sha256": digest(self.manifest.read_bytes()),
+                    "magisk_zip_comment_sha256": self.inputs["magisk_zip_comment_sha256"],
+                    "magisk_zip_comment_version_code": self.inputs["magisk_zip_comment_version_code"],
+                    "magisk_zip_comment_preserved": True,
                     "certificate_sha256": self.inputs["certificate_sha256"],
                     "signer_sha256": self.inputs["certificate_sha256"],
                     "package": PACKAGE, "version_code": 31100,
@@ -8627,7 +8668,7 @@ jobs:
         if-no-files-found: error
         retention-days: 14
   r13199-workflow-result:
-    name: R13.19.9 Ergebnis – Vorbereitung und vollständigen Build getrennt ausweisen
+    name: R13.19.10 Ergebnis – Vorbereitung und vollständigen Build getrennt ausweisen
     needs:
     - r13199-signing-setup
     - r139-hardened-pair-build
@@ -8671,7 +8712,7 @@ jobs:
             permitted = environment.get("BUILD_PERMITTED", "")
             setup_status = environment.get("SETUP_STATUS", "MISSING")
             report = {
-                "schema": "r13199.workflow-status-v1", "revision": "R13.19.9",
+                "schema": "r13199.workflow-status-v1", "revision": "R13.19.10",
                 "operation": operation if operation in ("check_signing_setup", "build_release") else "INVALID",
                 "github_run_id": environment.get("GITHUB_RUN_ID"),
                 "status": "FAIL", "jobs": jobs, "setup_status": setup_status if setup_status in SETUP_STATUSES else "UNRECOGNIZED",
@@ -8763,5 +8804,5 @@ jobs:
         path: R13199_WORKFLOW_STATUS.json
         if-no-files-found: warn
         retention-days: 14
-run-name: ${{ inputs.operation == 'build_release' && 'R13.19.9 – Signierter APK-Build und vollständige Tests' ||
-  'R13.19.9 – Einrichtung prüfen (keine APK)' }}
+run-name: ${{ inputs.operation == 'build_release' && 'R13.19.10 – Signierter APK-Build und vollständige Tests' ||
+  'R13.19.10 – Einrichtung prüfen (keine APK)' }}
